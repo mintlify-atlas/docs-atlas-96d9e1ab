@@ -1,0 +1,284 @@
+---
+title: "BrokerMessage — Type-Safe Message Wrapper"
+description: "BrokerMessage<T> wraps your payload with a UUID task_id, attempt counter, and optional disambiguator. Returned by publish, consume, and process_messages handlers."
+---
+
+`BrokerMessage<T>` is the primary data structure you interact with in Broccoli Queue. Every message flowing through a topic — whether published, consumed, or delivered to a `process_messages` handler — is wrapped in a `BrokerMessage`. It carries your typed payload alongside queue-management metadata: a unique identifier generated at publish time, a running attempt counter incremented on each rejection, and an optional disambiguator used by fairness queues to route work across isolated sub-queues. Understanding its fields and conversions is essential for building reliable, idempotent message processors.
+
+## `BrokerMessage<T>` Struct
+
+`BrokerMessage<T>` is generic over any payload type `T` that implements `Clone + serde::Serialize + serde::de::DeserializeOwned`. It is defined in `broccoli_queue::brokers::broker` and derived with `Debug`, `Clone`, `Serialize`, and `Deserialize`.
+
+```rust
+pub struct BrokerMessage<T: Clone> {
+    pub task_id: uuid::Uuid,
+    pub payload: T,
+    pub attempts: u8,
+    pub disambiguator: Option<String>,
+}
+```
+
+### Fields
+
+<ResponseField name="task_id" type="uuid::Uuid" required>
+  A globally unique version-4 UUID assigned when the message is first created via `BrokerMessage::new`. This value is preserved across retries — the same `task_id` is present whether it is the message's first delivery or its fifth. Use `task_id` as a deduplication key in your handler to achieve idempotency.
+</ResponseField>
+
+<ResponseField name="payload" type="T" required>
+  The strongly-typed message content. The type parameter `T` must implement `Clone`, `serde::Serialize`, and `serde::de::DeserializeOwned` so that Broccoli Queue can serialize it to the wire format and deserialize it back on consume. Access the payload directly as `msg.payload` inside a handler.
+</ResponseField>
+
+<ResponseField name="attempts" type="u8" required>
+  The number of times this message has been attempted. It starts at `0` on first delivery and is incremented each time the message is rejected and re-enqueued. You can inspect this value in your handler to apply custom backoff logic or skip processing after a threshold you manage yourself, independent of the global `RetryStrategy`.
+</ResponseField>
+
+<ResponseField name="disambiguator" type="Option<String>">
+  An optional string that identifies the fairness sub-queue this message belongs to. When `Some`, the Redis broker routes the message into an isolated per-disambiguator queue, ensuring that one high-volume producer cannot starve others. When `None`, the message enters the standard main queue. This field is set at publish time and flows unchanged through every retry.
+</ResponseField>
+
+## Type Bounds
+
+`T` must satisfy three trait bounds:
+
+| Bound | Why |
+|---|---|
+| `Clone` | Required by the broker trait and internal retry machinery |
+| `serde::Serialize` | Required to convert `BrokerMessage<T>` into `InternalBrokerMessage` (wire format) |
+| `serde::de::DeserializeOwned` | Required to reconstruct `BrokerMessage<T>` from the stored JSON payload |
+
+A typical payload type looks like:
+
+```rust
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EmailJob {
+    recipient: String,
+    subject: String,
+    body: String,
+}
+```
+
+## Constructor
+
+```rust
+impl<T: Clone + serde::Serialize> BrokerMessage<T> {
+    pub fn new(payload: T, disambiguator: Option<String>) -> Self
+}
+```
+
+`BrokerMessage::new` generates a fresh `uuid::Uuid::new_v4()` for `task_id`, sets `attempts` to `0`, and stores the provided `payload` and `disambiguator`. You rarely need to call this directly — `BroccoliQueue::publish` creates the message for you.
+
+## Wire Format Conversions
+
+Two `From` implementations convert a `BrokerMessage<T>` into the internal serialized wire format. Neither is part of the user-facing API; the broker implementations call them automatically.
+
+```rust
+// Consuming ownership
+impl<T: Clone + serde::Serialize> From<BrokerMessage<T>> for InternalBrokerMessage { ... }
+
+// Borrowing (used in publish_batch)
+impl<T: Clone + serde::Serialize> From<&BrokerMessage<T>> for InternalBrokerMessage { ... }
+```
+
+Both conversions serialize `payload` to a JSON string via `serde_json::to_string`, stringify `task_id` with `to_string()`, and forward `attempts` and `disambiguator` unchanged.
+
+## `InternalBrokerMessage`
+
+`InternalBrokerMessage` is the serialized wire format used by all broker implementations (Redis, RabbitMQ, SurrealDB). Its `payload` field is a raw JSON `String` rather than a typed `T`. **You should never construct `InternalBrokerMessage` directly.** The queue handles all conversions internally; your handlers always receive a fully-typed `BrokerMessage<T>`.
+
+```rust
+// Internal use only — shown for reference
+pub struct InternalBrokerMessage {
+    pub task_id: String,
+    pub payload: String,  // JSON-encoded T
+    pub attempts: u8,
+    pub disambiguator: Option<String>,
+}
+```
+
+---
+
+## Code Examples
+
+### 1. Receiving a message in `process_messages`
+
+The most common pattern. Broccoli Queue deserializes, delivers, and acknowledges (or rejects) automatically.
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EmailJob {
+    recipient: String,
+    subject: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), BroccoliError> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .failed_message_retry_strategy(Default::default())
+        .pool_connections(5)
+        .build()
+        .await?;
+
+    queue
+        .process_messages(
+            "emails",
+            Some(4), // 4 concurrent workers
+            None,
+            |msg: BrokerMessage<EmailJob>| async move {
+                println!(
+                    "[{}] Sending email to {} (attempt {})",
+                    msg.task_id, msg.payload.recipient, msg.attempts
+                );
+                // ... send the email ...
+                Ok(())
+            },
+        )
+        .await?;
+
+    Ok(())
+}
+```
+
+### 2. Manual consume and field access
+
+Use `consume` when you need explicit control over acknowledgment timing.
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct OrderPayload {
+    order_id: u64,
+    amount_cents: u64,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), BroccoliError> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .build()
+        .await?;
+
+    let msg: BrokerMessage<OrderPayload> = queue.consume("orders", None).await?;
+
+    println!("task_id    : {}", msg.task_id);
+    println!("attempts   : {}", msg.attempts);
+    println!("order_id   : {}", msg.payload.order_id);
+    println!("disambiguator: {:?}", msg.disambiguator);
+
+    // Manually acknowledge after confirming successful processing
+    queue.acknowledge("orders", msg).await?;
+
+    Ok(())
+}
+```
+
+### 3. Using `task_id` for idempotency
+
+Because `task_id` is stable across retries, you can use it as a deduplication key in your database or cache.
+
+```rust
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ChargePayload {
+    user_id: u64,
+    amount_cents: u64,
+}
+
+async fn handle_charge(
+    msg: BrokerMessage<ChargePayload>,
+    processed: Arc<Mutex<HashSet<String>>>,
+) -> Result<(), BroccoliError> {
+    let id = msg.task_id.to_string();
+
+    {
+        let mut seen = processed.lock().unwrap();
+        if seen.contains(&id) {
+            // Already processed on a previous attempt — skip safely
+            println!("Skipping duplicate task_id {id}");
+            return Ok(());
+        }
+        seen.insert(id.clone());
+    }
+
+    println!(
+        "Charging user {} for {} cents (task {})",
+        msg.payload.user_id, msg.payload.amount_cents, id
+    );
+    // ... perform charge ...
+    Ok(())
+}
+```
+
+---
+
+## `QueueStatus` Struct
+
+`QueueStatus` is returned by `BroccoliQueue::queue_status` (requires the `management` feature flag) and describes the current state of a named queue.
+
+```rust
+pub struct QueueStatus {
+    pub name: String,
+    pub queue_type: QueueType,
+    pub size: usize,
+    pub processing: usize,
+    pub failed: usize,
+    pub disambiguator_count: Option<usize>,
+}
+```
+
+<ResponseField name="name" type="String" required>
+  The name of the queue as passed to `queue_status`. Matches the topic name used in `publish` and `consume`.
+</ResponseField>
+
+<ResponseField name="queue_type" type="QueueType" required>
+  Indicates which logical queue is being described. See [`QueueType`](#queuetype-enum) below.
+</ResponseField>
+
+<ResponseField name="size" type="usize" required>
+  Number of messages currently sitting in the main (pending) queue, waiting to be consumed.
+</ResponseField>
+
+<ResponseField name="processing" type="usize" required>
+  Number of messages that have been consumed but not yet acknowledged or rejected. These are in the `{topic}_processing` queue.
+</ResponseField>
+
+<ResponseField name="failed" type="usize" required>
+  Number of messages that exhausted their retry budget and were moved to the `{topic}_failed` queue.
+</ResponseField>
+
+<ResponseField name="disambiguator_count" type="Option<usize>">
+  For fairness queues, the number of distinct active disambiguator sub-queues. `None` for non-fairness queues.
+</ResponseField>
+
+## `QueueType` Enum
+
+`QueueType` classifies each logical segment of a Broccoli topic.
+
+```rust
+pub enum QueueType {
+    Main,
+    Processing,
+    Failed,
+    Fairness,
+}
+```
+
+| Variant | Display | Description |
+|---|---|---|
+| `Main` | `"main"` | The primary pending queue. Published messages land here first. |
+| `Processing` | `"processing"` | Holds messages that have been consumed but not yet acknowledged. Named `{topic}_processing` internally. |
+| `Failed` | `"failed"` | Holds messages that exceeded the configured retry limit. Named `{topic}_failed` internally. |
+| `Fairness` | `"fairness"` | A per-disambiguator sub-queue used by the Redis broker's fairness routing. |
+
+<Tip>
+  Inspect `QueueStatus.failed` periodically to detect stuck or poison-pill messages. You can republish them to the main topic after investigation, or cancel them with `BroccoliQueue::cancel`.
+</Tip>

@@ -1,0 +1,198 @@
+---
+title: "Scheduling and Delaying Messages"
+description: "Schedule messages for future delivery using PublishOptions delay and scheduled_at. Enable scheduling in BroccoliQueue builder and configure RabbitMQ if needed."
+---
+
+Broccoli Queue can hold a message until a future moment before making it visible to consumers. You can express delivery timing in two ways: a relative delay from the time of publishing, or an absolute timestamp. Both are configured through `PublishOptions` and require scheduling to be explicitly enabled on the queue instance.
+
+---
+
+## Enabling Scheduling
+
+Scheduling is opt-in. Call `.enable_scheduling(true)` in the builder before calling `.build()`:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .enable_scheduling(true)
+    .build()
+    .await?;
+```
+
+<Warning>
+If you use **RabbitMQ** as your broker you must also install the [`rabbitmq-delayed-message-exchange`](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq) plugin on your RabbitMQ server before enabling scheduling. Redis and SurrealDB support scheduling natively without any additional setup.
+</Warning>
+
+---
+
+## Two Scheduling Approaches
+
+<Tabs>
+  <Tab title="delay — relative duration">
+    Use `delay` when you want the message delivered **N seconds/minutes/hours from now**. The clock starts at publish time.
+
+    ```rust
+    use broccoli_queue::queue::PublishOptions;
+    use time::Duration;
+
+    let options = PublishOptions::builder()
+        .delay(Duration::minutes(15))
+        .build();
+
+    queue.publish("reminders", None, &my_message, Some(options)).await?;
+    ```
+
+    Common examples:
+    - `Duration::seconds(30)` — 30-second retry cool-down
+    - `Duration::minutes(5)` — short deferral
+    - `Duration::hours(1)` — hourly reminder
+    - `Duration::days(1)` — next-day delivery
+  </Tab>
+  <Tab title="scheduled_at — absolute timestamp">
+    Use `scheduled_at` when you know the exact calendar time you want the message delivered — for example, 09:00 on the next business day or a user-chosen reminder time.
+
+    ```rust
+    use broccoli_queue::queue::PublishOptions;
+    use time::{Duration, OffsetDateTime};
+
+    // Deliver tomorrow at this exact time of day
+    let delivery_time = OffsetDateTime::now_utc() + Duration::days(1);
+
+    let options = PublishOptions::builder()
+        .schedule_at(delivery_time)
+        .build();
+
+    queue.publish("daily-digest", None, &my_message, Some(options)).await?;
+    ```
+
+    `OffsetDateTime` comes from the [`time`](https://docs.rs/time) crate, which is already a dependency of Broccoli Queue.
+  </Tab>
+</Tabs>
+
+---
+
+## How Scheduling Works Internally
+
+On **Redis**, scheduled messages are stored in a sorted set with the delivery timestamp as the score (nanoseconds since the Unix epoch). The consumer checks scores against the current time on every `consume` call and only returns messages whose score is in the past. This means `try_consume` will return `None` for a scheduled message that has not yet matured, while `consume` will block until the message becomes deliverable.
+
+On **SurrealDB**, scheduling is also supported without plugins. On **RabbitMQ**, the delayed-exchange plugin intercepts the message and re-routes it to the target queue after the specified delay.
+
+---
+
+## Full Code Example
+
+The snippet below demonstrates publishing with both a relative delay and an absolute schedule, then verifying that `try_consume` returns nothing while the message is still in the future.
+
+```rust
+use broccoli_queue::{
+    error::BroccoliError,
+    queue::{BroccoliQueue, PublishOptions},
+};
+use serde::{Deserialize, Serialize};
+use time::{Duration, OffsetDateTime};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Reminder {
+    id: String,
+    message: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), BroccoliError> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .enable_scheduling(true)
+        .build()
+        .await?;
+
+    // --- Approach 1: relative delay ---
+    let delayed_reminder = Reminder {
+        id: "reminder-1".to_string(),
+        message: "Check in on your task.".to_string(),
+    };
+
+    let delay_opts = PublishOptions::builder()
+        .delay(Duration::seconds(10))
+        .build();
+
+    let published = queue
+        .publish("reminders", None, &delayed_reminder, Some(delay_opts))
+        .await?;
+    println!("Delayed message published: {}", published.task_id);
+
+    // try_consume returns None because the delay hasn't elapsed yet
+    let early = queue
+        .try_consume::<Reminder>("reminders", None)
+        .await?;
+    assert!(early.is_none(), "message should not be available yet");
+
+    // --- Approach 2: absolute timestamp ---
+    let scheduled_reminder = Reminder {
+        id: "reminder-2".to_string(),
+        message: "Time to review the weekly report.".to_string(),
+    };
+
+    let delivery_time = OffsetDateTime::now_utc() + Duration::seconds(30);
+    let schedule_opts = PublishOptions::builder()
+        .schedule_at(delivery_time)
+        .build();
+
+    let scheduled = queue
+        .publish("reminders", None, &scheduled_reminder, Some(schedule_opts))
+        .await?;
+    println!(
+        "Scheduled message {} will be delivered at {}",
+        scheduled.task_id, delivery_time
+    );
+
+    // Wait and then consume normally
+    println!("Waiting for the delayed message to mature...");
+    tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+
+    let msg = queue
+        .consume::<Reminder>("reminders", None)
+        .await?;
+    println!("Received: {} — {}", msg.payload.id, msg.payload.message);
+
+    queue.acknowledge("reminders", msg).await?;
+
+    Ok(())
+}
+```
+
+---
+
+## Cancelling a Scheduled Message
+
+If you need to pull a scheduled (or any queued) message before it is consumed, call `queue.cancel` with the `task_id` string returned at publish time:
+
+```rust
+let published = queue.publish("reminders", None, &reminder, Some(opts)).await?;
+let task_id = published.task_id.to_string();
+
+// ... later, if the user cancels their reminder:
+queue.cancel("reminders", task_id).await?;
+```
+
+<Note>
+`cancel` is implemented for Redis and SurrealDB. On RabbitMQ it returns a `BroccoliError::NotImplemented` because the broker does not expose a mechanism to remove messages from the delayed exchange by ID. Check the returned error if you need to handle this gracefully across multiple broker backends.
+</Note>
+
+---
+
+## Scheduling at a Glance
+
+<CardGroup cols={2}>
+  <Card title="Relative — delay" icon="hourglass-half">
+    Use `PublishOptions::builder().delay(Duration::seconds(n))`. Counts from publish time. Best for cool-downs, retries, and brief deferrals.
+  </Card>
+  <Card title="Absolute — scheduled_at" icon="calendar-days">
+    Use `PublishOptions::builder().schedule_at(OffsetDateTime)`. Best for user-scheduled reminders, nightly batch jobs, or fixed-time deliveries.
+  </Card>
+  <Card title="Redis / SurrealDB" icon="database">
+    No extra setup needed beyond `enable_scheduling(true)`. Scheduling uses a sorted set (Redis) or native query features (SurrealDB).
+  </Card>
+  <Card title="RabbitMQ" icon="triangle-exclamation">
+    Requires the `rabbitmq-delayed-message-exchange` plugin installed on the broker and `enable_scheduling(true)` in the builder.
+  </Card>
+</CardGroup>

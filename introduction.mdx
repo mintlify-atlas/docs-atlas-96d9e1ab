@@ -1,0 +1,79 @@
+---
+title: "Broccoli Queue: Robust Async Jobs for Rust"
+description: "Broccoli Queue is a type-safe message queue library for Rust, offering Redis, RabbitMQ, and SurrealDB backends with Celery-inspired ergonomics."
+---
+
+Broccoli Queue (`broccoli_queue`) is an async Rust library for building reliable, high-throughput message pipelines. It wraps Redis, RabbitMQ, and SurrealDB behind a single, uniform API so you can publish jobs, process them concurrently, and handle failures — all without writing boilerplate broker code. If you have used Celery in Python and want the same ergonomics with Rust's performance and compile-time safety, Broccoli Queue is designed for exactly that use case.
+
+## Feature highlights
+
+<CardGroup cols={2}>
+  <Card title="Async processing" icon="bolt">
+    Built on [Tokio](https://tokio.rs/), every publish and consume operation is fully non-blocking. Spin up as many concurrent workers as your hardware allows with a single `concurrency` parameter.
+  </Card>
+  <Card title="Multiple broker backends" icon="database">
+    Switch between **Redis**, **RabbitMQ**, and **SurrealDB** by changing one Cargo feature flag. The queue API stays identical regardless of the backend.
+  </Card>
+  <Card title="Configurable retry strategies" icon="rotate-right">
+    Failed messages are automatically re-queued up to a configurable number of attempts via `RetryStrategy`. Messages that exhaust all retries move to a dead-letter queue.
+  </Card>
+  <Card title="Connection pooling" icon="server">
+    `BroccoliQueueBuilder::pool_connections` lets you pre-warm a pool of broker connections, eliminating per-message connection overhead under high load.
+  </Card>
+  <Card title="Type-safe messages" icon="shield-check">
+    Message payloads are generic over any type that implements `serde::Serialize + serde::DeserializeOwned`. Deserialization errors surface at compile time, not at runtime.
+  </Card>
+  <Card title="Fairness queues" icon="scale-balanced">
+    Enable per-disambiguator sub-queues (Redis only) so that a flood of messages from one producer cannot starve others. Activate with the `test-fairness` feature and `ConsumeOptions::fairness`.
+  </Card>
+  <Card title="Message scheduling" icon="clock">
+    Delay delivery with `PublishOptions::delay` or set an exact `scheduled_at` timestamp. RabbitMQ scheduling requires the [delayed-exchange plugin](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq).
+  </Card>
+  <Card title="Management API" icon="chart-bar">
+    Opt in to the `management` feature to unlock `BroccoliQueue::queue_status`, which surfaces pending, processing, and failed message counts for any named queue.
+  </Card>
+</CardGroup>
+
+## How it compares to Celery
+
+Celery is the de-facto task queue for Python, and Broccoli Queue draws direct inspiration from it. The table below maps the two concepts side by side.
+
+| Concept | Celery (Python) | Broccoli Queue (Rust) |
+|---|---|---|
+| Task definition | `@app.task` decorator | Any `async fn` accepting `BrokerMessage<T>` |
+| Publishing | `task.delay()` / `apply_async()` | `queue.publish()` / `queue.publish_batch()` |
+| Consuming | `celery worker` process | `queue.process_messages()` loop |
+| Retries | `autoretry_for`, `max_retries` | `RetryStrategy::with_attempts()` |
+| Routing | Named queues / exchanges | Topic strings passed to publish/consume |
+| Brokers | Redis, RabbitMQ, SQS, … | Redis, RabbitMQ, SurrealDB |
+| Result backend | Optional (Redis, DB, …) | `on_success` / `on_error` handler callbacks |
+| Scheduling | `eta` / `countdown` | `PublishOptions::delay` / `scheduled_at` |
+
+The key advantage over Celery is that Rust's type system makes payload shapes an explicit, checked contract. If a consumer cannot deserialize a message, the mismatch is caught at the call site rather than failing silently at runtime.
+
+## Available Cargo features
+
+Enable only the broker backends you actually need. Each feature pulls in only the dependencies required for that backend.
+
+| Feature | Default | What it enables |
+|---|---|---|
+| `redis` | ✅ Yes | Redis broker via `bb8-redis` connection pool |
+| `rabbitmq` | No | RabbitMQ broker via `lapin` + `deadpool-lapin` |
+| `surrealdb` | No | SurrealDB broker (in-process or remote) |
+| `management` | No | `queue_status` method and `QueueStatus` type |
+| `test-fairness` | No | Fairness queue support for integration testing |
+
+<Note>
+  At least one broker feature (`redis`, `rabbitmq`, or `surrealdb`) must be enabled. Broccoli Queue enforces this with a `compile_error!` so misconfigured builds fail immediately, never at runtime.
+</Note>
+
+## Start building
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Publish and consume your first message in under five minutes.
+  </Card>
+  <Card title="API Reference" icon="book" href="https://docs.rs/broccoli_queue">
+    Full rustdoc for every type, method, and error variant on docs.rs.
+  </Card>
+</CardGroup>

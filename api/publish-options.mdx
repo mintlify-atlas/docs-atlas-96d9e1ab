@@ -1,0 +1,270 @@
+---
+title: "PublishOptions — Message Delivery Configuration"
+description: "Configure TTL, priority, delay, and scheduled delivery time per message using PublishOptions and PublishOptionsBuilder when calling publish or publish_batch."
+---
+
+`PublishOptions` lets you control delivery behaviour for individual messages at the point of publishing. You can set a time-to-live so stale messages expire automatically, assign a priority level so higher-importance work is processed first, or schedule a message to become available after a fixed delay or at a specific wall-clock time. All fields are optional — omitting them leaves the message with no TTL, default priority, and immediate delivery.
+
+---
+
+## `PublishOptions` Struct
+
+```rust
+#[derive(Debug, Default, Clone)]
+pub struct PublishOptions {
+    pub ttl: Option<time::Duration>,
+    pub priority: Option<u8>,
+    pub delay: Option<time::Duration>,
+    pub scheduled_at: Option<time::OffsetDateTime>,
+}
+```
+
+### Fields
+
+<ParamField path="ttl" type="Option<time::Duration>">
+  Time-to-live for the message. When set, the broker will automatically discard the message if it has not been consumed within this duration. Uses `time::Duration` from the [`time`](https://docs.rs/time) crate. Defaults to `None` (no expiry).
+</ParamField>
+
+<ParamField path="priority" type="Option<u8>">
+  Priority level for the message. Must be between **1** (highest priority) and **5** (lowest priority). Messages with a lower numeric priority value are delivered before messages with a higher value. Defaults to `None`, which the broker treats as priority 5 (lowest). Setting a value outside 1–5 via the builder panics at runtime.
+</ParamField>
+
+<ParamField path="delay" type="Option<time::Duration>">
+  A duration to wait before the message becomes available for consumption. For example, `Duration::minutes(30)` makes the message invisible for 30 minutes after it is published. Requires `enable_scheduling(true)` on the queue builder.
+</ParamField>
+
+<ParamField path="scheduled_at" type="Option<time::OffsetDateTime>">
+  An absolute timestamp at which the message should be delivered. The broker will hold the message until the wall clock reaches this time. Mutually intended to be used instead of `delay`, not combined with it. Requires `enable_scheduling(true)` on the queue builder.
+</ParamField>
+
+---
+
+## `PublishOptionsBuilder`
+
+Use the builder to construct `PublishOptions` with a fluent, chainable API. Start with `PublishOptions::builder()` and call `.build()` to produce the final struct.
+
+### `PublishOptions::builder`
+
+```rust
+pub const fn builder() -> PublishOptionsBuilder
+```
+
+Returns a new `PublishOptionsBuilder` with all fields set to `None`.
+
+---
+
+### `.ttl`
+
+```rust
+pub const fn ttl(mut self, duration: time::Duration) -> Self
+```
+
+<ParamField path="duration" type="time::Duration" required>
+  How long the message should remain in the queue before being discarded. Uses `time::Duration` — for example, `Duration::seconds(60)` for a one-minute TTL.
+</ParamField>
+
+**Returns** — `Self` for chaining.
+
+```rust
+use time::Duration;
+use broccoli_queue::queue::PublishOptions;
+
+let options = PublishOptions::builder()
+    .ttl(Duration::minutes(10))
+    .build();
+```
+
+---
+
+### `.delay`
+
+```rust
+pub const fn delay(mut self, duration: time::Duration) -> Self
+```
+
+<ParamField path="duration" type="time::Duration" required>
+  Duration to wait after publishing before the message becomes consumable. The message sits in the broker's scheduled store until the delay elapses.
+</ParamField>
+
+**Returns** — `Self` for chaining.
+
+<Warning>
+  `delay` and `scheduled_at` both require `enable_scheduling(true)` to be set on the [`BroccoliQueueBuilder`](/api/broccoli-queue-builder). Without it, delayed messages may be delivered immediately or rejected by the broker.
+</Warning>
+
+```rust
+use time::Duration;
+
+let options = PublishOptions::builder()
+    .delay(Duration::minutes(30))
+    .build();
+
+queue.publish("jobs", None, &job, Some(options)).await?;
+```
+
+---
+
+### `.schedule_at`
+
+```rust
+pub const fn schedule_at(mut self, time: time::OffsetDateTime) -> Self
+```
+
+<ParamField path="time" type="time::OffsetDateTime" required>
+  The exact date and time at which the message should become available to consumers. Use `OffsetDateTime::now_utc() + Duration::hours(2)` to schedule two hours from now.
+</ParamField>
+
+**Returns** — `Self` for chaining.
+
+<Warning>
+  Like `delay`, `schedule_at` requires `enable_scheduling(true)` on the queue builder.
+</Warning>
+
+```rust
+use time::{OffsetDateTime, Duration};
+
+let delivery_time = OffsetDateTime::now_utc() + Duration::hours(2);
+
+let options = PublishOptions::builder()
+    .schedule_at(delivery_time)
+    .build();
+
+queue.publish("reminders", None, &reminder, Some(options)).await?;
+```
+
+---
+
+### `.priority`
+
+```rust
+pub fn priority(mut self, priority: u8) -> Self
+```
+
+<ParamField path="priority" type="u8" required>
+  Priority level for this message. Must be an integer in the range **1–5** inclusive. Priority 1 is consumed first; priority 5 is consumed last. Panics at runtime if the value is outside this range.
+</ParamField>
+
+**Returns** — `Self` for chaining.
+
+<Warning>
+  This method is **not** `const` because it contains a runtime assertion. Passing a value outside 1–5 will **panic**:
+
+  ```text
+  Priority must be between 1 and 5
+  ```
+
+  Validate user input before calling `.priority()` if the value comes from an external source.
+</Warning>
+
+```rust
+// High priority — process before standard jobs
+let urgent = PublishOptions::builder()
+    .priority(1)
+    .build();
+
+// Low priority — background work
+let background = PublishOptions::builder()
+    .priority(5)
+    .build();
+```
+
+---
+
+### `.build`
+
+```rust
+pub const fn build(self) -> PublishOptions
+```
+
+Consumes the builder and produces a `PublishOptions` struct. All fields that were not explicitly set remain `None`.
+
+**Returns** — A `PublishOptions` value ready to be passed to `publish` or `publish_batch`.
+
+---
+
+## Defaults
+
+When `None` is passed as the `options` argument to `publish` or `publish_batch`, the broker applies these defaults:
+
+| Field | Default |
+|---|---|
+| `ttl` | `None` — no expiry |
+| `priority` | `None` — treated as priority 5 (lowest) |
+| `delay` | `None` — immediate delivery |
+| `scheduled_at` | `None` — immediate delivery |
+
+---
+
+## Usage Examples
+
+### No options (immediate delivery)
+
+```rust
+queue.publish("jobs", None, &job, None).await?;
+```
+
+### TTL only — discard unprocessed messages after 5 minutes
+
+```rust
+use time::Duration;
+
+let options = PublishOptions::builder()
+    .ttl(Duration::minutes(5))
+    .build();
+
+queue.publish("ephemeral-jobs", None, &job, Some(options)).await?;
+```
+
+### High-priority urgent task
+
+```rust
+let options = PublishOptions::builder()
+    .priority(1)
+    .ttl(Duration::seconds(30))
+    .build();
+
+queue.publish("alerts", None, &alert, Some(options)).await?;
+```
+
+### Delayed delivery — process in 1 hour
+
+```rust
+use time::Duration;
+
+// Queue builder must have enable_scheduling(true)
+let options = PublishOptions::builder()
+    .delay(Duration::hours(1))
+    .build();
+
+queue.publish("scheduled-jobs", None, &job, Some(options)).await?;
+```
+
+### Scheduled delivery at a specific time
+
+```rust
+use time::{OffsetDateTime, Duration, macros::offset};
+
+let run_at = OffsetDateTime::now_utc()
+    .replace_time(time::Time::MIDNIGHT)
+    + Duration::days(1); // next midnight UTC
+
+let options = PublishOptions::builder()
+    .schedule_at(run_at)
+    .build();
+
+queue.publish("nightly-reports", None, &report, Some(options)).await?;
+```
+
+### Batch publish with shared options
+
+```rust
+use time::Duration;
+
+let options = PublishOptions::builder()
+    .priority(2)
+    .ttl(Duration::hours(24))
+    .build();
+
+let jobs: Vec<Job> = fetch_pending_jobs().await?;
+queue.publish_batch("jobs", None, jobs, Some(options)).await?;
+```

@@ -1,64 +1,87 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "Broccoli Queue",
+  "theme": "luma",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#94cb04",
+    "light": "#545454"
   },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": ["index", "quickstart"],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
+  "favicon": "https://media.brand.dev/288cc7c4-5cef-4376-950b-bdf0083eedae.png",
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/densumesh/broccoli"
     }
-  },
-  "contextual": {
-    "options": [
-     "copy",
-     "view",
-     "chatgpt",
-     "claude",
-     "perplexity",
-     "mcp",
-     "cursor",
-     "vscode"
-   ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/densumesh/broccoli"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/queue",
+              "concepts/messages",
+              "concepts/brokers",
+              "concepts/retry-strategy"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/publishing",
+              "guides/consuming",
+              "guides/scheduling",
+              "guides/fairness",
+              "guides/management"
+            ]
+          },
+          {
+            "group": "Broker Backends",
+            "pages": [
+              "brokers/redis",
+              "brokers/rabbitmq",
+              "brokers/surrealdb"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Queue",
+            "pages": [
+              "api/broccoli-queue",
+              "api/broccoli-queue-builder",
+              "api/publish-options",
+              "api/consume-options"
+            ]
+          },
+          {
+            "group": "Messages & Errors",
+            "pages": [
+              "api/broker-message",
+              "api/retry-strategy",
+              "api/errors"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

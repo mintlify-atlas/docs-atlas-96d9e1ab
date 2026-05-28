@@ -1,0 +1,177 @@
+---
+title: "Broker Backends: Redis, RabbitMQ, SurrealDB"
+description: "Broccoli Queue supports three broker backends selected by Cargo features and connection URL. Compare Redis, RabbitMQ, and SurrealDB for your use case."
+---
+
+A broker is the server-side storage engine that holds your queued messages, tracks which ones are in-flight, and enforces retry and dead-letter semantics. Broccoli Queue abstracts all three supported backends behind the same `Broker` trait, so your application code (publish, consume, acknowledge, reject) never changes when you switch backends — only the Cargo feature flag and the connection URL do.
+
+The backend is selected at **compile time** through a Cargo feature flag and at **runtime** by the URL scheme you pass to `BroccoliQueue::builder`. If the URL prefix does not match any enabled feature, `build()` returns a `BroccoliError::Broker` immediately.
+
+## Backend comparison
+
+| Backend | URL Prefix | Cargo Feature | Connection Pool | Notes |
+|---------|------------|---------------|-----------------|-------|
+| **Redis** | `redis://` | `redis` *(default)* | bb8-redis | Production-ready, lowest latency, best default choice |
+| **RabbitMQ** | `amqp://` | `rabbitmq` | deadpool-lapin | Scheduling requires the [delayed-exchange plugin](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq) |
+| **SurrealDB** | `ws://` or `mem://` | `surrealdb` | Built-in | `mem://` is ideal for tests; existing connections can be reused |
+
+## Enabling features in `Cargo.toml`
+
+You must enable at least one feature. The crate will refuse to compile otherwise.
+
+<Tabs>
+  <Tab title="Redis (default)">
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "*", features = ["redis"] }
+    ```
+  </Tab>
+  <Tab title="RabbitMQ">
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "*", features = ["rabbitmq"] }
+    ```
+  </Tab>
+  <Tab title="SurrealDB">
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "*", features = ["surrealdb"] }
+    ```
+  </Tab>
+  <Tab title="Multiple backends">
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "*", features = ["redis", "rabbitmq", "surrealdb"] }
+    ```
+
+    When multiple features are compiled in, the URL prefix at runtime selects which broker is instantiated.
+  </Tab>
+</Tabs>
+
+## URL-based broker selection
+
+`connect_to_broker` (called internally by `BroccoliQueueBuilder::build`) inspects the URL prefix and instantiates the correct backend:
+
+```
+"redis://..."   → RedisBroker
+"amqp://..."    → RabbitMQBroker
+"ws://..."      → SurrealDBBroker (remote WebSocket connection)
+"mem://..."     → SurrealDBBroker (in-memory, no external server)
+```
+
+Any other prefix returns `BroccoliError::Broker("Unsupported broker URL scheme")`.
+
+## `BrokerConfig` fields
+
+`BrokerConfig` is built from `BroccoliQueueBuilder` and passed to the broker on construction. You do not normally construct it yourself, but understanding its fields helps you reason about builder methods.
+
+```rust
+pub struct BrokerConfig {
+    /// Maximum retry attempts before a message is dead-lettered. Default: 3.
+    pub retry_attempts: Option<u8>,
+    /// Whether failed messages are retried at all. Default: true.
+    pub retry_failed: Option<bool>,
+    /// Size of the broker connection pool. Default: 10.
+    pub pool_connections: Option<u8>,
+    /// Whether delayed/scheduled publishing is enabled. Default: false.
+    pub enable_scheduling: Option<bool>,
+    // surrealdb feature only:
+    // pub surrealdb_connection: Option<surrealdb::Surreal<...>>,
+}
+```
+
+These correspond directly to the builder methods:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, RetryStrategy};
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .failed_message_retry_strategy(
+        RetryStrategy::new()
+            .with_attempts(5)
+            .retry_failed(true),
+    )
+    .pool_connections(20)
+    .enable_scheduling(false)
+    .build()
+    .await?;
+```
+
+## Backend-specific notes
+
+<Accordion title="Redis">
+  Redis is the recommended backend for most production workloads. It uses `bb8` for async connection pooling and stores queues as Redis lists. The processing queue is a separate list key, so messages survive a worker crash and are not lost.
+
+  **Fairness queues** (via the `disambiguator` field) are fully supported with Redis: each unique disambiguator value gets its own sub-list, and the consumer round-robins across them.
+
+  ```rust
+  let queue = BroccoliQueue::builder("redis://localhost:6379")
+      .pool_connections(10)
+      .build()
+      .await?;
+  ```
+</Accordion>
+
+<Accordion title="RabbitMQ">
+  RabbitMQ uses `deadpool-lapin` for connection pooling. It maps Broccoli topics to AMQP queues and uses consumer acknowledgements natively.
+
+  **Scheduling** requires the `rabbitmq_delayed_message_exchange` plugin. Enable it before turning on `enable_scheduling(true)`:
+
+  ```bash
+  rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+  ```
+
+  ```rust
+  let queue = BroccoliQueue::builder("amqp://guest:guest@localhost:5672")
+      .enable_scheduling(true)
+      .build()
+      .await?;
+  ```
+
+  <Warning>
+    Calling `enable_scheduling(true)` without the delayed-exchange plugin installed will cause publish calls to fail at runtime.
+  </Warning>
+</Accordion>
+
+<Accordion title="SurrealDB">
+  The SurrealDB broker stores messages as records in SurrealDB tables. It is the only backend that supports reusing an existing database connection via `BroccoliQueue::builder_with(db)`, making it a natural fit for applications already running SurrealDB.
+
+  ```rust
+  #[cfg(feature = "surrealdb")]
+  {
+      // Option A: let Broccoli open its own connection.
+      let queue = BroccoliQueue::builder("ws://localhost:8000")
+          .build()
+          .await?;
+
+      // Option B: reuse your application's existing connection.
+      let queue = BroccoliQueue::builder_with(existing_surreal_db)
+          .build()
+          .await?;
+  }
+  ```
+</Accordion>
+
+<Tip>
+  Use `mem://` with the SurrealDB backend to run Broccoli entirely in-process during unit and integration tests — no external server required, no Docker Compose, no teardown. Messages are stored in memory and discarded when the process exits.
+
+  ```rust
+  #[cfg(test)]
+  async fn test_queue() {
+      let queue = BroccoliQueue::builder("mem://")
+          .build()
+          .await
+          .expect("in-memory queue should always connect");
+      // ... test publish/consume/acknowledge ...
+  }
+  ```
+</Tip>
+
+<CardGroup cols={2}>
+  <Card title="The BroccoliQueue" icon="layer-group" href="/concepts/queue">
+    Builder pattern, URL schemes, cloning, and the full queue lifecycle.
+  </Card>
+  <Card title="Retry Strategies" icon="arrows-rotate" href="/concepts/retry-strategy">
+    Configure retry counts and dead-letter behaviour across all backends.
+  </Card>
+</CardGroup>

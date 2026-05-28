@@ -1,0 +1,222 @@
+---
+title: "Redis Broker Backend for Broccoli Queue"
+description: "The Redis broker is Broccoli Queue's default backend. Configure connection pooling with bb8, use sorted sets for priority and scheduling, and enable fairness queues."
+---
+
+The Redis broker is the default and most feature-complete backend in Broccoli Queue. It stores messages in Redis sorted sets, leveraging the score field to encode both priority and scheduled delivery time in a single atomic structure. Because every queue operation is expressed as a Lua script executed inside Redis, publish, consume, acknowledge, and reject are all individually atomic — no distributed locks or external coordination required.
+
+## Enabling the Redis Feature
+
+Redis is the default feature in `broccoli_queue`, so no extra configuration is needed for a standard dependency declaration:
+
+```toml
+[dependencies]
+broccoli_queue = "0.4.6"
+```
+
+To be explicit, or when combining it with other features, list it in the `features` array:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4.6", features = ["redis"] }
+```
+
+## Connection URL Format
+
+The Redis broker accepts any URL scheme that the underlying `redis` crate understands:
+
+| Scheme | Example | Notes |
+|--------|---------|-------|
+| `redis://` | `redis://localhost:6379` | Unencrypted, anonymous |
+| `redis://user:pass@host:port` | `redis://alice:s3cr3t@10.0.0.5:6379` | With credentials |
+| `rediss://` | `rediss://cache.example.com:6380` | TLS-encrypted connection |
+
+## Docker Quickstart
+
+Spin up a Redis 7 instance locally in one command:
+
+```bash
+docker run -d -p 6379:6379 redis:7
+```
+
+## Queue Setup
+
+Use `BroccoliQueue::builder` with the Redis URL, then call `.build().await` to establish the connection pool:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(10)
+        .build()
+        .await?;
+
+    Ok(())
+}
+```
+
+### Builder Options
+
+| Method | Type | Default | Description |
+|--------|------|---------|-------------|
+| `pool_connections(n)` | `u8` | `10` | Maximum bb8 pool size |
+| `enable_scheduling(true)` | `bool` | `false` | Honour `delay` / `scheduled_at` on publish |
+| `failed_message_retry_strategy(s)` | `RetryStrategy` | 3 attempts | Retry policy for rejected messages |
+
+## Internal Data Structures
+
+The Redis broker maps each Broccoli concept to a native Redis type:
+
+<CardGroup cols={2}>
+  <Card title="Main Queue" icon="list">
+    **Sorted set** keyed as `{topic}`.
+    Score = `priority × unix_timestamp_nanos`. Lower scores are popped first, so priority 1 always beats priority 5.
+  </Card>
+  <Card title="Processing Queue" icon="clock">
+    **List** keyed as `{topic}_processing` (or `{topic}_{disambiguator}_processing` for fairness queues).
+    Holds task IDs currently being processed, enabling at-least-once delivery.
+  </Card>
+  <Card title="Failed Queue" icon="triangle-exclamation">
+    **List** keyed as `{topic}_failed`.
+    Messages are pushed here after exhausting all retry attempts, preserving them for inspection or manual replay.
+  </Card>
+  <Card title="Message Hash" icon="database">
+    **Hash** keyed by `task_id`.
+    Stores `payload`, `attempts`, `priority`, and optionally `disambiguator` per message.
+  </Card>
+</CardGroup>
+
+## Queue Naming Conventions
+
+| Key pattern | Purpose |
+|-------------|---------|
+| `{topic}` | Main sorted-set queue |
+| `{topic}_processing` | In-flight message list |
+| `{topic}_failed` | Dead-letter list |
+| `{topic}_{disambiguator}_queue` | Per-entity fairness sorted set |
+| `{topic}_fairness_set` | Set tracking active disambiguators |
+| `{topic}_fairness_round_robin` | List used for round-robin scheduling |
+
+## Connection Pool
+
+The Redis broker uses [bb8-redis](https://crates.io/crates/bb8-redis) as its connection pool:
+
+- **Default pool size:** 10 multiplexed connections
+- **Connection timeout:** 2 seconds
+- **Reconnection:** exponential backoff starting at 1 s, capped at 300 s
+- Connections are multiplexed; each logical call borrows a slot from the pool rather than occupying a TCP connection exclusively
+
+```rust
+// Increase the pool for high-throughput services
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .pool_connections(50)
+    .build()
+    .await?;
+```
+
+## Feature Support
+
+| Feature | Supported | Notes |
+|---------|-----------|-------|
+| Priority (1–5) | ✅ | Encoded in the sorted-set score |
+| Scheduling / delays | ✅ | Requires `.enable_scheduling(true)` |
+| Fairness queues | ✅ | Pass `disambiguator` on publish; consume with `ConsumeOptions::builder().fairness(true)` |
+| Management API | ✅ | Enable the `management` feature |
+| Batch publish | ✅ | `queue.publish_batch(...)` |
+| TTL | ✅ | Set via `PublishOptions::builder().ttl(...)` |
+| Cancel | ✅ | `queue.cancel(topic, task_id)` removes from the sorted set |
+
+<Note>
+Redis is Broccoli Queue's most feature-complete broker backend. All optional capabilities — priority, scheduling, fairness, TTL, cancel, and the management API — are fully supported. Use Redis when you want the richest feature set with the lowest operational overhead.
+</Note>
+
+## Full Example
+
+The example below publishes a job with priority 2 and a 30-second delay, then processes messages concurrently with four workers:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions, ConsumeOptions};
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+use time::Duration;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EmailJob {
+    recipient: String,
+    subject: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Build the queue with a 20-connection pool and scheduling enabled
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(20)
+        .enable_scheduling(true)
+        .build()
+        .await?;
+
+    // Publish a high-priority job with a 30-second delivery delay
+    let job = EmailJob {
+        recipient: "user@example.com".to_string(),
+        subject: "Welcome!".to_string(),
+    };
+
+    queue
+        .publish(
+            "emails",
+            None,
+            &job,
+            Some(
+                PublishOptions::builder()
+                    .priority(2)
+                    .delay(Duration::seconds(30))
+                    .build(),
+            ),
+        )
+        .await?;
+
+    // Consume messages with fairness disabled (standard round-robin is Redis-native)
+    queue
+        .process_messages(
+            "emails",
+            Some(4), // 4 concurrent workers
+            None,
+            |message: BrokerMessage<EmailJob>| async move {
+                println!(
+                    "Sending email to {} — attempt {}",
+                    message.payload.recipient, message.attempts
+                );
+                Ok(())
+            },
+        )
+        .await?;
+
+    Ok(())
+}
+```
+
+### Fairness Queue Example
+
+When multiple tenants share the same topic, use a disambiguator so no single producer starves the others:
+
+```rust
+// Publish on behalf of two different tenants
+queue.publish("tasks", Some("tenant-a".to_string()), &job_a, None).await?;
+queue.publish("tasks", Some("tenant-b".to_string()), &job_b, None).await?;
+
+// Consume with fairness enabled — alternates between tenant-a and tenant-b
+let consume_opts = ConsumeOptions::builder().fairness(true).build();
+queue
+    .process_messages(
+        "tasks",
+        Some(2),
+        Some(consume_opts),
+        |message: BrokerMessage<MyJob>| async move {
+            println!("Processing for {:?}", message.disambiguator);
+            Ok(())
+        },
+    )
+    .await?;
+```

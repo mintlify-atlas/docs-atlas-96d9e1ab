@@ -1,0 +1,419 @@
+---
+title: "BroccoliError — Error Types Reference"
+description: "BroccoliError enumerates all Broccoli Queue error conditions: broker connection, publish, consume, acknowledge, reject, cancel, serialization, Redis, and SurrealDB errors."
+---
+
+Every fallible operation in Broccoli Queue returns `Result<T, BroccoliError>`. `BroccoliError` is a `thiserror`-based enum that covers the full surface of the library — from initial broker connection through message lifecycle (publish, consume, acknowledge, reject, cancel) to underlying driver errors from Redis or SurrealDB. Each variant carries enough context to understand the failure without needing to inspect raw driver error objects. Where the underlying cause is itself an error type (e.g., `serde_json::Error`), it is wrapped directly so you can access it via standard `std::error::Error` source chaining.
+
+## Enum Definition
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum BroccoliError {
+    Broker(String),
+    BrokerNonIdempotentOp(String),
+    BrokerNonIdempotentRetriableOp(String),
+    Publish(String),
+    Consume(String),
+    Acknowledge(String),
+    Reject(String),
+    Cancel(String),
+    GetMessagePosition(String),
+    Serialization(serde_json::Error),
+    #[cfg(feature = "redis")]
+    Redis(redis::RedisError),
+    #[cfg(feature = "surrealdb")]
+    SurrealDB(surrealdb::Error),
+    Job(String),
+    QueueStatus(String),
+    ConnectionTimeout(u32),
+    NotImplemented,
+}
+```
+
+## Variant Reference
+
+<AccordionGroup>
+
+<Accordion title="Broker(String) — General broker errors">
+  **Display:** `Broker error: {0}`
+
+  Returned for general broker-level failures that do not fit a more specific category. Common causes include:
+
+  - Failed TCP/UNIX connections when the broker URL is unreachable
+  - Connection pool initialization errors at `build()` time
+  - Unexpected broker responses that cannot be mapped to a more specific variant
+
+  This is often the first error you will encounter when a broker is misconfigured or unavailable. Check the inner `String` for the underlying driver message.
+
+  ```rust
+  match err {
+      BroccoliError::Broker(msg) => {
+          eprintln!("Broker unreachable: {msg}");
+      }
+      _ => {}
+  }
+  ```
+</Accordion>
+
+<Accordion title="BrokerNonIdempotentOp(String) — Concurrent SurrealDB reads on the same topic">
+  **Display:** `Broker error: non-idempotent operation {0}`
+
+  Emitted exclusively by the SurrealDB broker when multiple concurrent readers attempt to consume from the same topic simultaneously. SurrealDB's transaction model cannot guarantee which consumer receives a specific message under concurrent reads, so the broker surfaces this as a distinct error rather than silently delivering duplicate messages.
+
+  This variant is **not retriable** — the operation should be aborted and the concurrency structure reconsidered. If you need parallel consumers with SurrealDB, route each worker to a distinct topic or disambiguator.
+
+  ```rust
+  match err {
+      BroccoliError::BrokerNonIdempotentOp(msg) => {
+          log::error!("Concurrent SurrealDB read conflict: {msg}");
+          // Do not retry — redesign concurrency
+      }
+      _ => {}
+  }
+  ```
+</Accordion>
+
+<Accordion title="BrokerNonIdempotentRetriableOp(String) — Concurrent SurrealDB writes, retriable">
+  **Display:** `Broker error: non-idempotent retriable operation {0}`
+
+  Similar to `BrokerNonIdempotentOp`, but arises from concurrent write operations on the same SurrealDB table (e.g., multiple publishers writing to the same topic simultaneously). The key distinction is that this variant **is safe to retry** — the SurrealDB transaction was aborted cleanly and can be re-submitted.
+
+  The `process_messages` loop handles this variant internally by logging and continuing without crashing the worker goroutine.
+
+  ```rust
+  match err {
+      BroccoliError::BrokerNonIdempotentRetriableOp(msg) => {
+          log::warn!("Retriable SurrealDB write conflict: {msg}. Retrying...");
+          // Safe to retry the operation
+      }
+      _ => {}
+  }
+  ```
+</Accordion>
+
+<Accordion title="Publish(String) — Message publish failures">
+  **Display:** `Failed to publish message: {0}`
+
+  Returned by `BroccoliQueue::publish` and `BroccoliQueue::publish_batch` when the broker cannot accept the message. Common causes include:
+
+  - Network errors writing to Redis/RabbitMQ/SurrealDB
+  - The broker rejecting the message due to queue limits or policy
+  - Internal serialization failure when converting `T` to `InternalBrokerMessage`
+
+  ```rust
+  match queue.publish("orders", None, &payload, None).await {
+      Err(BroccoliError::Publish(msg)) => {
+          eprintln!("Failed to enqueue order: {msg}");
+      }
+      _ => {}
+  }
+  ```
+</Accordion>
+
+<Accordion title="Consume(String) — Message consume failures">
+  **Display:** `Failed to consume message: {0}`
+
+  Returned by `BroccoliQueue::consume`, `try_consume`, `consume_batch`, and `try_consume_batch`. Covers:
+
+  - Network errors reading from the broker
+  - Deserialization failures when reconstructing `BrokerMessage<T>` from the stored JSON payload
+  - The broker returning an unexpected message format
+
+  When `process_messages` encounters this variant it logs the error and continues the loop without crashing, so transient network blips do not bring down long-running workers.
+
+  ```rust
+  match queue.consume::<MyPayload>("jobs", None).await {
+      Err(BroccoliError::Consume(msg)) => {
+          eprintln!("Could not receive message: {msg}");
+      }
+      _ => {}
+  }
+  ```
+</Accordion>
+
+<Accordion title="Acknowledge(String) — Acknowledgment failures">
+  **Display:** `Failed to acknowledge message: {0}`
+
+  Returned by `BroccoliQueue::acknowledge` when the broker cannot confirm that message processing is complete. This usually means:
+
+  - A network interruption between the acknowledge call and the broker
+  - The message was not found in the processing queue (e.g., it already timed out and was requeued)
+
+  <Warning>
+    If an acknowledgment fails, the message remains in the `{topic}_processing` queue and will be redelivered when a recovery process or broker timeout moves it back to the main queue. Design handlers to be idempotent so that redelivery does not cause duplicate side-effects.
+  </Warning>
+
+  ```rust
+  if let Err(BroccoliError::Acknowledge(msg)) = queue.acknowledge("jobs", message).await {
+      log::error!("Ack failed — message may be redelivered: {msg}");
+  }
+  ```
+</Accordion>
+
+<Accordion title="Reject(String) — Reject/re-queue failures">
+  **Display:** `Failed to reject message: {0}`
+
+  Returned by `BroccoliQueue::reject` when the broker cannot move the message back to the main queue or to the failed queue. This can happen due to:
+
+  - Network interruption during the reject operation
+  - The message not being present in the processing queue
+  - A SurrealDB transaction conflict when moving the record
+
+  The `process_messages` loop logs this error but does not crash — the message's fate depends on broker-side timeout and recovery mechanisms.
+
+  ```rust
+  if let Err(BroccoliError::Reject(msg)) = queue.reject("jobs", message).await {
+      log::error!("Reject failed: {msg}");
+  }
+  ```
+</Accordion>
+
+<Accordion title="Cancel(String) — Cancel/delete failures">
+  **Display:** `Failed to cancel message: {0}`
+
+  Returned by `BroccoliQueue::cancel` when the broker cannot delete a message by its `task_id`. This is typically used to remove a message that has been superseded or is no longer relevant before it is consumed.
+
+  ```rust
+  match queue.cancel("orders", task_id.to_string()).await {
+      Err(BroccoliError::Cancel(msg)) => {
+          eprintln!("Could not cancel message {task_id}: {msg}");
+      }
+      _ => {}
+  }
+  ```
+</Accordion>
+
+<Accordion title="GetMessagePosition(String) — Position lookup failures">
+  **Display:** `Failed to get message position: {0}`
+
+  Returned when the broker cannot determine the position of a message within the queue. Not all brokers support position lookups — see `NotImplemented` below for the case where the operation is structurally unsupported.
+
+  ```rust
+  match err {
+      BroccoliError::GetMessagePosition(msg) => {
+          eprintln!("Position lookup failed: {msg}");
+      }
+      _ => {}
+  }
+  ```
+</Accordion>
+
+<Accordion title="Serialization(serde_json::Error) — JSON serialization/deserialization errors">
+  **Display:** `Serialization error: {0}`
+
+  A transparent wrapper around `serde_json::Error`, produced when `serde_json::to_string` or `serde_json::from_str` fails during payload conversion. Common causes:
+
+  - The payload type `T` contains a field that cannot be serialized (e.g., a raw pointer or a type with a custom `Serialize` that returns an error)
+  - The stored JSON in the broker is malformed or was written by an incompatible version of your payload type
+  - A schema change added a non-`Option` field without a migration strategy
+
+  Because this variant implements `From<serde_json::Error>`, it is automatically produced by the `?` operator wherever JSON conversion is used internally.
+
+  ```rust
+  match err {
+      BroccoliError::Serialization(json_err) => {
+          eprintln!("JSON error at line {}: {}", json_err.line(), json_err);
+      }
+      _ => {}
+  }
+  ```
+</Accordion>
+
+<Accordion title="Redis(redis::RedisError) — Redis driver errors [feature = redis]">
+  **Display:** `Redis error: {0}`
+
+  A transparent wrapper around `redis::RedisError`. Only present when the `redis` feature is enabled. Produced when the underlying `redis` crate returns an error that cannot be mapped to a higher-level `BroccoliError` variant. This includes:
+
+  - Authentication failures (`NOAUTH`, `WRONGPASS`)
+  - Cluster topology errors
+  - Protocol-level parse errors
+  - Connection pool exhaustion from the `deadpool-redis` layer
+
+  ```rust
+  #[cfg(feature = "redis")]
+  match err {
+      BroccoliError::Redis(redis_err) => {
+          eprintln!("Redis error (kind={:?}): {redis_err}", redis_err.kind());
+      }
+      _ => {}
+  }
+  ```
+</Accordion>
+
+<Accordion title="SurrealDB(surrealdb::Error) — SurrealDB driver errors [feature = surrealdb]">
+  **Display:** `SurrealDB error: {0}`
+
+  A transparent wrapper around `surrealdb::Error`. Only present when the `surrealdb` feature is enabled. Produced for low-level SurrealDB failures including:
+
+  - Query execution errors
+  - Authentication and permission errors on the SurrealDB instance
+  - WebSocket transport errors when using the `ws://` or `wss://` endpoints
+  - Schema violations if SurrealDB is run in strict mode
+
+  ```rust
+  #[cfg(feature = "surrealdb")]
+  match err {
+      BroccoliError::SurrealDB(db_err) => {
+          eprintln!("SurrealDB error: {db_err}");
+      }
+      _ => {}
+  }
+  ```
+</Accordion>
+
+<Accordion title="Job(String) — Job processing errors">
+  **Display:** `Job error: {0}`
+
+  A general-purpose variant for errors originating inside job handler logic. You can return this variant from your own `process_messages` handler to signal a domain-level failure distinct from infrastructure errors.
+
+  ```rust
+  use broccoli_queue::error::BroccoliError;
+
+  async fn handle_job(msg: BrokerMessage<MyPayload>) -> Result<(), BroccoliError> {
+      if msg.payload.amount == 0 {
+          return Err(BroccoliError::Job("Amount must be non-zero".to_string()));
+      }
+      Ok(())
+  }
+  ```
+</Accordion>
+
+<Accordion title="QueueStatus(String) — Queue status retrieval errors [feature = management]">
+  **Display:** `Queue status error: {0}`
+
+  Returned by `BroccoliQueue::queue_status` (only available with the `management` feature flag) when the broker cannot retrieve metadata about the requested queue. Common causes:
+
+  - The queue does not exist yet (no messages have been published)
+  - The broker does not support status introspection for the given `QueueType`
+  - Network or permission errors querying the broker's metadata APIs
+
+  ```rust
+  #[cfg(feature = "management")]
+  match queue.queue_status("emails".to_string(), None).await {
+      Err(BroccoliError::QueueStatus(msg)) => {
+          eprintln!("Cannot retrieve queue status: {msg}");
+      }
+      _ => {}
+  }
+  ```
+</Accordion>
+
+<Accordion title="ConnectionTimeout(u32) — Connection timeout after N retries">
+  **Display:** `Connection timeout after {0} retries`
+
+  Returned during `BroccoliQueueBuilder::build` when the broker URL is reachable but the handshake or authentication sequence does not complete within the allowed number of retry attempts. The wrapped `u32` value is the number of attempts that were made before giving up.
+
+  ```rust
+  match BroccoliQueue::builder("redis://localhost:6379").build().await {
+      Err(BroccoliError::ConnectionTimeout(n)) => {
+          eprintln!("Could not connect after {n} attempts. Is the broker running?");
+      }
+      _ => {}
+  }
+  ```
+</Accordion>
+
+<Accordion title="NotImplemented — Feature not supported by this broker">
+  **Display:** `Feature not implemented`
+
+  Returned when you call an operation that is not supported by the active broker backend. The canonical example is requesting the position of a message when using RabbitMQ — the AMQP protocol does not expose a queue-position API. This variant carries no inner message because the failure is structural rather than contextual.
+
+  ```rust
+  match err {
+      BroccoliError::NotImplemented => {
+          eprintln!(
+              "This operation is not supported by the current broker. \
+               Check the feature flags and broker documentation."
+          );
+      }
+      _ => {}
+  }
+  ```
+
+  <Note>
+    If you encounter `NotImplemented`, check the [broker comparison table](#) in the core documentation to confirm which operations each backend supports.
+  </Note>
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## Error Handling Patterns
+
+### Matching on specific variants
+
+Match on the variants you care about and use a wildcard arm for the rest to remain forward-compatible.
+
+```rust
+use broccoli_queue::error::BroccoliError;
+
+fn handle_error(err: BroccoliError) {
+    match err {
+        BroccoliError::Publish(msg) => {
+            eprintln!("Publish failed: {msg}");
+        }
+        BroccoliError::Consume(msg) => {
+            eprintln!("Consume failed: {msg}");
+        }
+        BroccoliError::ConnectionTimeout(n) => {
+            eprintln!("Timed out after {n} retries — check broker connectivity");
+        }
+        BroccoliError::NotImplemented => {
+            eprintln!("Operation not supported by this broker backend");
+        }
+        other => {
+            eprintln!("Unhandled error: {other}");
+        }
+    }
+}
+```
+
+### Propagating errors with `?`
+
+`BroccoliError` implements `std::error::Error`, so it composes naturally with `?` in `async fn` contexts that return `Result<_, BroccoliError>`. The `From` implementations for `serde_json::Error`, `redis::RedisError`, and `surrealdb::Error` mean those driver errors convert automatically.
+
+```rust
+use broccoli_queue::{queue::BroccoliQueue, error::BroccoliError};
+
+async fn enqueue_job(queue: &BroccoliQueue, payload: &MyPayload) -> Result<(), BroccoliError> {
+    queue.publish("jobs", None, payload, None).await?;
+    Ok(())
+}
+```
+
+### Logging errors in `process_messages` handlers
+
+Return `Err` from your handler to trigger a reject — Broccoli Queue logs the error and applies the configured `RetryStrategy` automatically. For fine-grained observability, log before returning.
+
+```rust
+use broccoli_queue::{brokers::broker::BrokerMessage, error::BroccoliError};
+use tracing::{error, warn};
+
+async fn handle_payment(msg: BrokerMessage<PaymentPayload>) -> Result<(), BroccoliError> {
+    match process_payment(&msg.payload).await {
+        Ok(_) => Ok(()),
+        Err(e) if is_transient(&e) => {
+            warn!(
+                task_id = %msg.task_id,
+                attempt = msg.attempts,
+                "Transient payment error, will retry: {e}"
+            );
+            Err(BroccoliError::Job(e.to_string()))
+        }
+        Err(e) => {
+            error!(
+                task_id = %msg.task_id,
+                "Permanent payment failure after {} attempts: {e}",
+                msg.attempts
+            );
+            Err(BroccoliError::Job(e.to_string()))
+        }
+    }
+}
+```
+
+<Tip>
+  Tag your log lines with `msg.task_id` so you can correlate retries of the same message across log entries. Because `task_id` is stable across retries, a single trace query on that UUID will show the full delivery history.
+</Tip>

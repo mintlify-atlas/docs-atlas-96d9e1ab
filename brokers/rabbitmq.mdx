@@ -1,0 +1,248 @@
+---
+title: "RabbitMQ Broker Backend for Broccoli Queue"
+description: "Use RabbitMQ as a Broccoli Queue backend with the rabbitmq feature. Supports AMQP, connection pooling via deadpool-lapin, and message scheduling with the delayed-exchange plugin."
+---
+
+The RabbitMQ broker lets you route Broccoli Queue messages through any AMQP-compatible server. It declares a durable `broccoli` exchange, binds per-topic queues to it with dead-letter routing enabled, and delivers messages as persistent AMQP publications. Connection management is handled by [deadpool-lapin](https://crates.io/crates/deadpool-lapin) so your application automatically reuses connections from a bounded pool instead of opening a new TCP session on every operation.
+
+## Enabling the RabbitMQ Feature
+
+Add the `rabbitmq` feature to your `Cargo.toml`. If you are switching away from the default Redis backend, explicitly disable the default features to avoid compiling the Redis dependency:
+
+<Tabs>
+  <Tab title="RabbitMQ only">
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "0.4.6", default-features = false, features = ["rabbitmq"] }
+    ```
+  </Tab>
+  <Tab title="RabbitMQ + Redis">
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "0.4.6", features = ["rabbitmq"] }
+    ```
+  </Tab>
+</Tabs>
+
+## Connection URL Format
+
+RabbitMQ connections use the standard AMQP URI scheme:
+
+```
+amqp://[user:password@]host[:port][/vhost]
+```
+
+| Example | Description |
+|---------|-------------|
+| `amqp://guest:guest@localhost:5672` | Default local credentials, default vhost |
+| `amqp://alice:s3cr3t@rabbit.internal:5672/production` | Custom credentials and vhost |
+| `amqps://user:pass@rabbit.example.com:5671` | TLS-encrypted AMQP (amqps scheme) |
+
+## Docker Quickstart
+
+<Tabs>
+  <Tab title="Standard image (no scheduling)">
+    ```bash
+    docker run -d \
+      -p 5672:5672 \
+      -p 15672:15672 \
+      rabbitmq:3-management
+    ```
+  </Tab>
+  <Tab title="With delayed-message plugin (scheduling)">
+    Use the provided `Dockerfile.rabbitmq` from the repository, which pre-installs the `rabbitmq_delayed_message_exchange` plugin:
+
+    ```bash
+    docker build -f Dockerfile.rabbitmq -t broccoli-rabbitmq .
+    docker run -d \
+      -p 5672:5672 \
+      -p 15672:15672 \
+      broccoli-rabbitmq
+    ```
+
+    The Dockerfile downloads plugin version `v4.0.7` and enables it via `rabbitmq-plugins enable rabbitmq_delayed_message_exchange`.
+  </Tab>
+</Tabs>
+
+## Queue Setup
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("amqp://guest:guest@localhost:5672")
+        .pool_connections(10)
+        .build()
+        .await?;
+
+    Ok(())
+}
+```
+
+On first connection, the broker:
+1. Creates a `broccoli` direct exchange (or `x-delayed-message` exchange when scheduling is enabled).
+2. Declares each topic as a durable AMQP queue with `x-max-priority = 5` and a dead-letter routing key pointing to `{topic}_failed`.
+3. Binds the queue to the `broccoli` exchange using the topic name as the routing key.
+
+### Builder Options
+
+| Method | Type | Default | Description |
+|--------|------|---------|-------------|
+| `pool_connections(n)` | `u8` | `10` | Maximum deadpool-lapin pool size |
+| `enable_scheduling(true)` | `bool` | `false` | Switches exchange to `x-delayed-message` type |
+| `failed_message_retry_strategy(s)` | `RetryStrategy` | 3 attempts | Retry policy for rejected messages |
+
+## Connection Pool
+
+The RabbitMQ broker uses [deadpool-lapin](https://crates.io/crates/deadpool-lapin) for AMQP connection pooling:
+
+- **Pool mode:** FIFO — connections are recycled in the order they were returned, minimising idle connection churn.
+- **Default pool size:** 10 connections.
+- **Timeouts:** 2 seconds each for wait, create, and recycle phases.
+- **Channel management:** consumer channels are stored in a `DashMap<String, Channel>` keyed by task ID, ensuring each in-flight message has a dedicated channel for acknowledgement and rejection without holding a pool connection open.
+
+## Message Scheduling
+
+<Warning>
+Calling `.enable_scheduling(true)` on the builder switches the `broccoli` exchange from a standard `direct` type to `x-delayed-message`. This requires the **rabbitmq-delayed-message-exchange** plugin to be installed and enabled on the server before the first connection is made.
+
+Without the plugin, the broker will fail to declare the exchange and return a connection error. See the official guide: [Scheduling Messages with RabbitMQ](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq).
+</Warning>
+
+When scheduling is active, Broccoli passes delays and scheduled times as the AMQP `x-delay` header (in milliseconds). The plugin holds the message in the exchange until the delay expires, then routes it to the destination queue as a normal delivery.
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+use time::Duration;
+
+let queue = BroccoliQueue::builder("amqp://guest:guest@localhost:5672")
+    .enable_scheduling(true)
+    .build()
+    .await?;
+
+queue
+    .publish(
+        "notifications",
+        None,
+        &my_payload,
+        Some(
+            PublishOptions::builder()
+                .delay(Duration::minutes(5))
+                .build(),
+        ),
+    )
+    .await?;
+```
+
+## Feature Support
+
+| Feature | Supported | Notes |
+|---------|-----------|-------|
+| Priority (1–5) | ✅ | Mapped to AMQP `x-max-priority`; note that priority is inverted: AMQP priority 4 = Broccoli priority 1 (highest) |
+| Scheduling / delays | ✅ | Requires `rabbitmq-delayed-message-exchange` plugin |
+| Fairness queues | ❌ | Not supported; use Redis for fairness |
+| Management API | ✅ | Enable the `management` feature |
+| Batch publish | ✅ | `queue.publish_batch(...)` |
+| TTL | ✅ | Set via `PublishOptions::builder().ttl(...)` — maps to AMQP `expiration` property |
+| Cancel | ❌ | Returns `BroccoliError::NotImplemented` |
+
+## Internal Architecture
+
+```
+┌────────────────────────────────────────────────────────┐
+│  broccoli exchange  (direct or x-delayed-message)      │
+│                                                        │
+│   routing key: "emails"  ──►  emails queue (durable)  │
+│                               DLX ──► emails_failed   │
+│   routing key: "tasks"   ──►  tasks queue (durable)   │
+│                               DLX ──► tasks_failed    │
+└────────────────────────────────────────────────────────┘
+```
+
+Each queue is declared with:
+- `durable: true` — survives broker restarts.
+- `x-max-priority: 5` — enables native AMQP priority levels 0–4 (mapped from Broccoli's 1–5 scale).
+- `x-dead-letter-routing-key: {topic}_failed` — rejected messages with no remaining retries are automatically routed to the failed queue by the broker.
+
+Messages are published as persistent deliveries (`delivery_mode: 2`) with a unique `message_id` property set to the Broccoli `task_id`.
+
+<Tip>
+The RabbitMQ management UI is available at [http://localhost:15672](http://localhost:15672) when using the `rabbitmq:3-management` Docker image or the custom `Dockerfile.rabbitmq`. Log in with `guest`/`guest` to inspect queue depths, message rates, consumer counts, and dead-letter contents in real time — without writing any code.
+</Tip>
+
+## Full Example
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions, ConsumeOptions};
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+use time::Duration;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct OrderEvent {
+    order_id: String,
+    status: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Build the queue against a RabbitMQ server with the delayed-exchange plugin
+    let queue = BroccoliQueue::builder("amqp://guest:guest@localhost:5672")
+        .pool_connections(10)
+        .enable_scheduling(true)
+        .build()
+        .await?;
+
+    // Publish an urgent event immediately (priority 1 = highest)
+    queue
+        .publish(
+            "orders",
+            None,
+            &OrderEvent {
+                order_id: "ORD-001".to_string(),
+                status: "created".to_string(),
+            },
+            Some(PublishOptions::builder().priority(1).build()),
+        )
+        .await?;
+
+    // Publish a low-priority reminder to be delivered in 1 hour
+    queue
+        .publish(
+            "orders",
+            None,
+            &OrderEvent {
+                order_id: "ORD-001".to_string(),
+                status: "reminder".to_string(),
+            },
+            Some(
+                PublishOptions::builder()
+                    .priority(5)
+                    .delay(Duration::hours(1))
+                    .build(),
+            ),
+        )
+        .await?;
+
+    // Process messages with 3 concurrent workers
+    queue
+        .process_messages(
+            "orders",
+            Some(3),
+            None,
+            |message: BrokerMessage<OrderEvent>| async move {
+                println!(
+                    "Order {} is now '{}' (attempt {})",
+                    message.payload.order_id,
+                    message.payload.status,
+                    message.attempts
+                );
+                Ok(())
+            },
+        )
+        .await?;
+
+    Ok(())
+}
+```

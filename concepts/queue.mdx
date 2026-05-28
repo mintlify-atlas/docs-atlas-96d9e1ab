@@ -1,0 +1,149 @@
+---
+title: "The BroccoliQueue: Central Queue Interface"
+description: "BroccoliQueue is the main entry point for all publish, consume, and process operations. Learn how the queue builder and broker connection work."
+---
+
+`BroccoliQueue` is the top-level struct you interact with to publish messages, consume them, and run continuous processing loops. It holds an `Arc<Box<dyn Broker>>` under the hood, meaning the queue is cheap to clone and safe to share across async tasks without any additional synchronization. You construct one through its builder, point it at a broker URL, tune a few optional settings, and call `.build().await` — after that, a single `BroccoliQueue` instance can serve your entire application.
+
+## Building a queue
+
+Every `BroccoliQueue` starts from `BroccoliQueue::builder(url)`. The builder follows a fluent, method-chaining style: each configuration method consumes `self` and returns an updated builder, so the compiler enforces that you configure the queue before connecting.
+
+<Steps>
+  <Step title="Create the builder">
+    Call `BroccoliQueue::builder(url)` with a broker URL. The URL scheme tells Broccoli which backend to use — see [Broker Backends](/concepts/brokers) for the full list.
+
+    ```rust
+    let builder = BroccoliQueue::builder("redis://localhost:6379");
+    ```
+  </Step>
+
+  <Step title="Configure retry behaviour">
+    Attach a `RetryStrategy` to control what happens when a handler returns an error. Omitting this step uses the default of 3 attempts with retries enabled.
+
+    ```rust
+    use broccoli_queue::queue::RetryStrategy;
+
+    let builder = builder.failed_message_retry_strategy(
+        RetryStrategy::new().with_attempts(5),
+    );
+    ```
+  </Step>
+
+  <Step title="Set pool size (optional)">
+    Tune the number of broker connections held in the pool. The default is `10`.
+
+    ```rust
+    let builder = builder.pool_connections(20);
+    ```
+  </Step>
+
+  <Step title="Enable scheduling (optional)">
+    Turn on delayed/scheduled message publishing. For RabbitMQ, this requires the [delayed-exchange plugin](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq).
+
+    ```rust
+    let builder = builder.enable_scheduling(true);
+    ```
+  </Step>
+
+  <Step title="Build and connect">
+    Call `.build().await`. This establishes the broker connection and returns a `Result<BroccoliQueue, BroccoliError>`.
+
+    ```rust
+    let queue = builder.build().await?;
+    ```
+  </Step>
+</Steps>
+
+## URL scheme → broker selection
+
+The URL scheme you pass to `BroccoliQueue::builder` determines which broker implementation is instantiated at runtime, provided the matching Cargo feature is enabled.
+
+| URL prefix | Broker | Feature flag |
+|------------|--------|--------------|
+| `redis://` | Redis | `redis` (default) |
+| `amqp://` | RabbitMQ | `rabbitmq` |
+| `ws://` | SurrealDB (remote) | `surrealdb` |
+| `mem://` | SurrealDB (in-memory) | `surrealdb` |
+
+If the URL prefix does not match any enabled feature, `build()` returns `BroccoliError::Broker("Unsupported broker URL scheme")`.
+
+## Full example
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, RetryStrategy};
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EmailJob {
+    recipient: String,
+    subject: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), BroccoliError> {
+    // Build the queue — connects to Redis and configures 5 retry attempts.
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .failed_message_retry_strategy(
+            RetryStrategy::new().with_attempts(5),
+        )
+        .pool_connections(10)
+        .build()
+        .await?;
+
+    // Publish a message.
+    let job = EmailJob {
+        recipient: "user@example.com".into(),
+        subject: "Welcome!".into(),
+    };
+    queue.publish("emails", None, &job, None).await?;
+
+    // Process messages in a continuous loop with 4 concurrent workers.
+    queue
+        .process_messages("emails", Some(4), None, |msg: BrokerMessage<EmailJob>| async move {
+            println!("Sending email to {}", msg.payload.recipient);
+            Ok(())
+        })
+        .await?;
+
+    Ok(())
+}
+```
+
+## Cloning and sharing
+
+`BroccoliQueue` implements `Clone`. Cloning it is `O(1)` — it only increments the reference count on the inner `Arc`. This makes it straightforward to share a queue across Axum handlers, Tokio tasks, or any other concurrent context without wrapping it yourself.
+
+```rust
+// Both handles point at the same underlying broker connection pool.
+let queue_a = queue.clone();
+let queue_b = queue.clone();
+
+tokio::spawn(async move { queue_a.publish("topic", None, &payload_a, None).await });
+tokio::spawn(async move { queue_b.publish("topic", None, &payload_b, None).await });
+```
+
+## Queue lifecycle
+
+When you call `build()`, Broccoli establishes one or more connections to your broker and stores them in an internal pool. Every subsequent `publish`, `consume`, `acknowledge`, or `reject` call borrows a connection from that pool, performs the operation, and returns the connection. The `process_messages` method runs an infinite loop (or spawns `concurrency` Tokio tasks, each running their own loop) and is designed to run for the lifetime of your service.
+
+## Reusing a SurrealDB connection
+
+If your application already holds a `surrealdb::Surreal` connection, you can hand it directly to the builder to avoid opening a second one:
+
+```rust
+#[cfg(feature = "surrealdb")]
+let queue = BroccoliQueue::builder_with(existing_db_connection)
+    .build()
+    .await?;
+```
+
+<CardGroup cols={2}>
+  <Card title="Messages" icon="envelope" href="/concepts/messages">
+    Learn about `BrokerMessage<T>`, task IDs, and the acknowledge/reject lifecycle.
+  </Card>
+  <Card title="Broker Backends" icon="server" href="/concepts/brokers">
+    Compare Redis, RabbitMQ, and SurrealDB and choose the right backend.
+  </Card>
+</CardGroup>

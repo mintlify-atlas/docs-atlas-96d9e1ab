@@ -1,47 +1,262 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with Broccoli Queue"
+description: "Learn how to publish and consume messages with Broccoli Queue in Rust in under 5 minutes. Covers queue setup, publishing, and processing with a handler."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+This guide walks you through publishing jobs to a named topic and processing them with a concurrent handler — all in a single Rust workspace. By the end you will have two working binaries: a publisher that enqueues jobs with an optional delay and an immediate batch, and a consumer that processes them with four parallel workers.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
-
-## Prerequisites
-
-Before you begin, you must have:
-
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+<Note>
+  Broccoli Queue requires a Tokio async runtime. Make sure your project depends on `tokio` with the `full` feature set, or at minimum `rt-multi-thread` and `macros`.
+</Note>
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+### Add the dependency
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+Open your `Cargo.toml` and add `broccoli_queue`. The `redis` feature is included by default, so the shortest form works for most projects:
 
-    ```bash
-    your-cli start
-    ```
-  </Step>
-</Steps>
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4.6", features = ["redis"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+time = "0.3"
+```
 
 <Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
-
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+  Omit `features = ["redis"]` if you just write `broccoli_queue = "0.4.6"` — Redis is the default feature and is activated automatically.
 </Tip>
+
+### Start Redis
+
+Broccoli Queue needs a running broker. The quickest way to get Redis locally is via Docker:
+
+```bash
+docker run --rm -p 6379:6379 redis:7-alpine
+```
+
+Leave this terminal open. Your publisher and consumer will both connect to `redis://localhost:6379`.
+
+### Build the publisher
+
+Create `src/bin/publisher.rs` (or a standalone example). The code below is adapted directly from the official `examples/publisher.rs`:
+
+```rust
+use broccoli_queue::{
+    error::BroccoliError,
+    queue::{BroccoliQueue, PublishOptions},
+};
+use serde::{Deserialize, Serialize};
+use time::Duration;
+
+/// The message payload that travels through the queue.
+/// Must implement Serialize + DeserializeOwned so Broccoli can encode/decode it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobPayload {
+    id: String,
+    task_name: String,
+    parameters: Parameters,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Parameters {
+    input_data: String,
+    priority: u8,
+    timeout_seconds: u32,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), BroccoliError> {
+    // Connect to Redis and configure the queue.
+    // pool_connections pre-warms 5 Redis connections.
+    // failed_message_retry_strategy enables up to 3 automatic retries.
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .failed_message_retry_strategy(Default::default())
+        .pool_connections(5)
+        .build()
+        .await?;
+
+    // ── Delayed batch ────────────────────────────────────────────────────────
+    // These jobs will not become visible to consumers until 10 seconds have
+    // elapsed. Useful for scheduling future work.
+    let delayed_jobs = vec![
+        JobPayload {
+            id: "job-1".to_string(),
+            task_name: "process_data".to_string(),
+            parameters: Parameters {
+                input_data: "data-1".to_string(),
+                priority: 1,
+                timeout_seconds: 300,
+            },
+            created_at: chrono::Utc::now(),
+        },
+        JobPayload {
+            id: "job-2".to_string(),
+            task_name: "generate_report".to_string(),
+            parameters: Parameters {
+                input_data: "data-2".to_string(),
+                priority: 2,
+                timeout_seconds: 600,
+            },
+            created_at: chrono::Utc::now(),
+        },
+    ];
+
+    println!("Publishing delayed jobs...");
+    let published = queue
+        .publish_batch(
+            "jobs",      // topic name — consumers subscribe to the same string
+            None,        // disambiguator (None = no fairness sub-queue)
+            delayed_jobs,
+            Some(PublishOptions {
+                delay: Some(Duration::seconds(10)), // deliver after 10 s
+                scheduled_at: None,
+                ttl: None,
+                priority: None,
+            }),
+        )
+        .await?;
+
+    println!(
+        "Enqueued delayed jobs: {:?}",
+        published.iter().map(|j| j.task_id).collect::<Vec<_>>()
+    );
+
+    // ── Immediate batch ──────────────────────────────────────────────────────
+    // Passing None for PublishOptions delivers messages immediately.
+    let immediate_jobs = vec![
+        JobPayload {
+            id: "job-3".to_string(),
+            task_name: "process_data".to_string(),
+            parameters: Parameters {
+                input_data: "data-3".to_string(),
+                priority: 1,
+                timeout_seconds: 300,
+            },
+            created_at: chrono::Utc::now(),
+        },
+        JobPayload {
+            id: "job-4".to_string(),
+            task_name: "generate_report".to_string(),
+            parameters: Parameters {
+                input_data: "data-4".to_string(),
+                priority: 2,
+                timeout_seconds: 600,
+            },
+            created_at: chrono::Utc::now(),
+        },
+    ];
+
+    println!("Publishing immediate jobs...");
+    let published = queue
+        .publish_batch("jobs", None, immediate_jobs, None)
+        .await?;
+
+    println!(
+        "Enqueued immediate jobs: {:?}",
+        published.iter().map(|j| j.task_id).collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
+```
+
+`publish_batch` returns a `Vec<BrokerMessage<T>>` containing the assigned `task_id` UUIDs for every message. You can store these for later acknowledgement or cancellation.
+
+### Build the consumer
+
+Create `src/bin/consumer.rs`. The consumer calls `process_messages` with `concurrency = Some(4)`, which spawns four long-lived Tokio tasks each pulling messages off the `"jobs"` topic in a tight loop:
+
+```rust
+use broccoli_queue::{error::BroccoliError, queue::BroccoliQueue};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobPayload {
+    id: String,
+    task_name: String,
+    parameters: Parameters,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Parameters {
+    input_data: String,
+    priority: u8,
+    timeout_seconds: u32,
+}
+
+/// Your domain logic lives here. Return Err to trigger a retry/reject.
+async fn process_job(job: JobPayload) -> Result<(), BroccoliError> {
+    println!("Processing job: {} ({})", job.id, job.task_name);
+
+    // Simulate I/O-bound work — replace with your real logic.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialise env_logger so Broccoli's internal log:: calls are visible.
+    env_logger::init();
+
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .failed_message_retry_strategy(Default::default())
+        .build()
+        .await?;
+
+    // process_messages blocks forever, polling the "jobs" topic.
+    // concurrency = Some(4) → four parallel Tokio worker tasks.
+    // The closure receives a BrokerMessage<JobPayload>; extract the payload
+    // with msg.payload and forward it to your handler.
+    queue
+        .process_messages("jobs", Some(4), None, |msg| async move {
+            process_job(msg.payload).await
+        })
+        .await
+        .unwrap();
+
+    Ok(())
+}
+```
+
+`process_messages` acknowledges messages automatically on `Ok(())` and calls `reject` on `Err(...)`, triggering the retry strategy you configured on the builder. You can swap it for `process_messages_with_handlers` when you need explicit `on_success` and `on_error` callbacks.
+
+### Run both binaries
+
+Open two terminal windows side by side.
+
+**Terminal 1 — start the consumer first:**
+
+```bash
+RUST_LOG=info cargo run --bin consumer
+```
+
+**Terminal 2 — publish the jobs:**
+
+```bash
+cargo run --bin publisher
+```
+
+You should see the consumer's terminal print four `Processing job:` lines almost immediately (for the two immediate jobs), and then two more after roughly ten seconds when the delayed jobs become visible.
+
+</Steps>
+
+## Next steps
+
+<CardGroup cols={3}>
+  <Card title="Publishing guide" icon="paper-plane" href="/guides/publishing">
+    Explore single-message publish, priority levels, TTL, and scheduled delivery in depth.
+  </Card>
+  <Card title="Consuming guide" icon="inbox" href="/guides/consuming">
+    Learn about `try_consume`, `consume_batch`, manual acknowledge/reject, and fairness queues.
+  </Card>
+  <Card title="Queue concepts" icon="sitemap" href="/concepts/queue">
+    Understand topics, disambiguators, retry strategies, and the message lifecycle.
+  </Card>
+</CardGroup>

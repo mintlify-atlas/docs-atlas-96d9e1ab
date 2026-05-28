@@ -1,0 +1,178 @@
+---
+title: "Installing Broccoli Queue in Your Rust Project"
+description: "Add broccoli_queue to Cargo.toml with your chosen broker feature. Covers Redis (default), RabbitMQ, SurrealDB, and the management API feature flag."
+---
+
+Broccoli Queue is published on [crates.io](https://crates.io/crates/broccoli_queue) and installs like any other Rust dependency — a single line in `Cargo.toml`. Because the library supports multiple broker backends, it uses Cargo feature flags to include only the dependencies you actually need. This page explains every available flag and the minimum environment requirements.
+
+<Warning>
+  At least one broker feature — `redis`, `rabbitmq`, or `surrealdb` — must be enabled. Broccoli Queue enforces this constraint with a `compile_error!` macro in `src/lib.rs`, so a misconfigured build fails immediately at compile time rather than panicking at runtime.
+</Warning>
+
+## Choose your broker
+
+<Tabs>
+  <Tab title="Redis (default)">
+    Redis is the default broker and requires no explicit feature flag. Either form below is equivalent:
+
+    ```toml
+    [dependencies]
+    # Shortest form — redis feature is on by default
+    broccoli_queue = "0.4.6"
+
+    # Explicit form — same result
+    broccoli_queue = { version = "0.4.6", features = ["redis"] }
+    ```
+
+    <Note>
+      `redis` is the default Cargo feature. If you add `broccoli_queue` without specifying `features`, Redis support is included automatically. You only need to write `features = ["redis"]` explicitly when combining it with other features or when you have set `default-features = false`.
+    </Note>
+
+    The Redis feature pulls in `bb8-redis` (an async connection pool built on `bb8`) and the `redis` crate compiled with TLS support via `tokio-rustls`. Point the builder at any Redis-compatible URL:
+
+    ```toml
+    # Standard local Redis
+    redis://localhost:6379
+
+    # With authentication
+    redis://:password@hostname:6379
+
+    # TLS-encrypted (Upstash, Redis Cloud, etc.)
+    rediss://hostname:6380
+    ```
+  </Tab>
+
+  <Tab title="RabbitMQ">
+    Enable the `rabbitmq` feature to use an AMQP 0-9-1 broker such as RabbitMQ. If you do **not** want Redis, also set `default-features = false`:
+
+    ```toml
+    [dependencies]
+    # RabbitMQ only — disable the Redis default
+    broccoli_queue = { version = "0.4.6", default-features = false, features = ["rabbitmq"] }
+    ```
+
+    If you want both Redis and RabbitMQ simultaneously, keep the default features and add `rabbitmq`:
+
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "0.4.6", features = ["rabbitmq"] }
+    ```
+
+    The `rabbitmq` feature brings in `lapin` (the AMQP client), `deadpool`, and `deadpool-lapin` for connection pooling. Use a standard AMQP URL:
+
+    ```toml
+    amqp://guest:guest@localhost:5672/%2f
+    ```
+
+    <Warning>
+      Message scheduling (`PublishOptions::delay` / `scheduled_at`) with RabbitMQ requires the [rabbitmq-delayed-message-exchange](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq) plugin. Enable it with `BroccoliQueueBuilder::enable_scheduling(true)`.
+    </Warning>
+  </Tab>
+
+  <Tab title="SurrealDB">
+    Enable the `surrealdb` feature for a SurrealDB-backed queue. Disable the Redis default if you do not need it:
+
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "0.4.6", default-features = false, features = ["surrealdb"] }
+    ```
+
+    The `surrealdb` feature enables the `surrealdb` crate (compiled with `kv-mem` for in-process storage) and `url` for connection-string parsing.
+
+    You can connect via a WebSocket URL to a running SurrealDB server:
+
+    ```toml
+    ws://localhost:8000
+    ```
+
+    Or, for testing and embedded use cases, pass an existing `surrealdb::Surreal` connection directly using the `builder_with` constructor instead of `builder`:
+
+    ```rust
+    // Reuse an existing SurrealDB handle (surrealdb feature only)
+    let queue = BroccoliQueue::builder_with(existing_db_handle)
+        .build()
+        .await?;
+    ```
+  </Tab>
+
+  <Tab title="Multiple backends">
+    Enable several broker features at once when your application needs to read from one broker and write to another, or when you want to test against multiple brokers in the same workspace:
+
+    ```toml
+    [dependencies]
+    # Redis (default) + RabbitMQ
+    broccoli_queue = { version = "0.4.6", features = ["rabbitmq"] }
+
+    # Redis + RabbitMQ + SurrealDB — all three
+    broccoli_queue = { version = "0.4.6", features = ["rabbitmq", "surrealdb"] }
+
+    # RabbitMQ + SurrealDB, no Redis
+    broccoli_queue = { version = "0.4.6", default-features = false, features = ["rabbitmq", "surrealdb"] }
+    ```
+
+    The broker used at runtime is determined by the URL scheme you pass to `BroccoliQueue::builder`:
+
+    | URL prefix | Backend selected |
+    |---|---|
+    | `redis://` or `rediss://` | Redis |
+    | `amqp://` or `amqps://` | RabbitMQ |
+    | `ws://` or `wss://` | SurrealDB |
+  </Tab>
+</Tabs>
+
+## Management API
+
+The optional `management` feature unlocks the `BroccoliQueue::queue_status` method, which returns a `QueueStatus` value containing the number of pending, in-flight, and failed messages for a given topic and disambiguator. Pair it with any broker feature:
+
+```toml
+[dependencies]
+# Management API + Redis (most common combination)
+broccoli_queue = { version = "0.4.6", features = ["redis", "management"] }
+
+# Management API + RabbitMQ
+broccoli_queue = { version = "0.4.6", default-features = false, features = ["rabbitmq", "management"] }
+```
+
+Calling `queue_status` in code:
+
+```rust
+#[cfg(feature = "management")]
+let status = queue
+    .queue_status("jobs".to_string(), None)
+    .await?;
+
+println!("Pending: {}", status.pending);
+println!("Processing: {}", status.processing);
+println!("Failed: {}", status.failed);
+```
+
+<Info>
+  The `management` feature adds the `derive_more` crate for display formatting on the `QueueStatus` type. No additional runtime service or sidecar is required.
+</Info>
+
+## All feature flags at a glance
+
+| Feature | Enabled by default | Dependencies added | What it unlocks |
+|---|---|---|---|
+| `redis` | ✅ Yes | `bb8-redis`, `redis` (TLS) | Redis broker, `redis://` / `rediss://` URL scheme |
+| `rabbitmq` | No | `lapin`, `deadpool`, `deadpool-lapin` | RabbitMQ broker, `amqp://` / `amqps://` URL scheme |
+| `surrealdb` | No | `surrealdb` (kv-mem), `url` | SurrealDB broker, `ws://` / `wss://` URL scheme, `builder_with` constructor |
+| `management` | No | `derive_more` | `BroccoliQueue::queue_status`, `QueueStatus` type |
+| `test-fairness` | No | *(none)* | Fairness queue code paths for integration tests |
+
+## Requirements
+
+- **Rust edition:** 2021 (declared in `broccoli_queue`'s own `Cargo.toml`; your project edition does not need to match)
+- **Minimum Rust version:** stable channel; no nightly features are used
+- **Async runtime:** [Tokio](https://tokio.rs/) — `broccoli_queue` depends on `tokio` with the `full` feature internally. Your binary should declare:
+
+```toml
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+```
+
+- **Broker:** a running instance of whichever backend you enable (Redis ≥ 6, RabbitMQ ≥ 3.8, or SurrealDB ≥ 2)
+
+<Tip>
+  For local development, Docker Compose is the fastest way to spin up any of the supported brokers. The [Quickstart](/quickstart) page includes a one-liner for Redis.
+</Tip>

@@ -1,0 +1,239 @@
+---
+title: "Queue Management and Status Monitoring"
+description: "Enable the management feature flag to inspect queue status, size, processing count, and failed message count. Use queue_status and size for observability."
+---
+
+Broccoli Queue ships a lightweight management API that lets you inspect the health of any queue at runtime — how many messages are waiting, how many are being processed, and how many have failed. This is useful for building dashboards, alerting pipelines, and autoscaling controllers without querying the underlying broker directly.
+
+---
+
+## Enabling the Management Feature
+
+The `queue_status` method requires the optional `management` Cargo feature. Add it to your `Cargo.toml`:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "*", features = ["redis", "management"] }
+```
+
+<Note>
+The `management` feature is compatible with Redis and RabbitMQ brokers. It is **not** compatible with the `surrealdb` feature — if you enable both, the build will fail. Use `queue.size()` (always available, no feature required) as a lighter alternative when working with SurrealDB.
+</Note>
+
+---
+
+## `queue.size` — Always Available
+
+`size` does not require the `management` feature and works with all brokers. It returns a `HashMap<String, u64>` mapping each sub-queue name to its pending message count.
+
+```rust
+let sizes = queue.size("my-topic").await?;
+
+for (sub_queue, count) in &sizes {
+    println!("{}: {} messages", sub_queue, count);
+}
+```
+
+- For a standard (non-fairness) queue the map has one entry: `{ "my-topic": N }`.
+- For a fairness queue the map has one entry per active disambiguator: `{ "my-topic_tenant-a_queue": N, "my-topic_tenant-b_queue": M }`.
+
+<Warning>
+Passing an empty string `""` as the `queue_name` argument returns a `BroccoliError`. This guard exists to prevent a wildcard `KEYS *` scan on Redis, which would block the server under large keyspaces.
+</Warning>
+
+---
+
+## `queue.queue_status` — Full Status (Requires `management` Feature)
+
+`queue_status` returns a `QueueStatus` struct with a complete snapshot of a queue's state:
+
+```rust
+#[cfg(feature = "management")]
+pub async fn queue_status(
+    &self,
+    queue_name: String,
+    disambiguator: Option<String>,
+) -> Result<QueueStatus, BroccoliError>
+```
+
+### `QueueStatus` Fields
+
+```rust
+pub struct QueueStatus {
+    pub name: String,               // resolved queue name
+    pub queue_type: QueueType,      // Main, Processing, Failed, or Fairness
+    pub size: usize,                // messages waiting to be consumed
+    pub processing: usize,          // messages currently in-flight
+    pub failed: usize,              // messages that exhausted retries
+    pub disambiguator_count: Option<usize>, // number of active sub-queues (fairness only)
+}
+```
+
+### `QueueType` Enum
+
+```rust
+pub enum QueueType {
+    Main,        // standard queue without fairness
+    Processing,  // in-flight messages
+    Failed,      // exhausted-retry messages
+    Fairness,    // fairness queue with disambiguators
+}
+```
+
+### The `disambiguator` Parameter
+
+| Value | Effect |
+|---|---|
+| `None` | Returns aggregate status across **all** sub-queues for the topic. |
+| `Some("tenant-a")` | Returns status for the single `{topic}_tenant-a` sub-queue only. |
+
+A non-existent queue or disambiguator does not return an error — it returns a `QueueStatus` with all counts set to `0`.
+
+---
+
+## Full Working Example
+
+The code below is adapted from `tests/management.rs`. It publishes messages, checks the queue status, then cleans up.
+
+```rust
+use broccoli_queue::{
+    brokers::management::QueueType,
+    error::BroccoliError,
+    queue::{BroccoliQueue, ConsumeOptions},
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Task {
+    id: String,
+    content: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), BroccoliError> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .build()
+        .await?;
+
+    let topic = "my-tasks";
+
+    // 1. Empty queue — all counts are 0
+    let status = queue
+        .queue_status(topic.to_string(), None)
+        .await?;
+
+    assert_eq!(status.size, 0);
+    assert_eq!(status.processing, 0);
+    assert_eq!(status.failed, 0);
+    println!("Empty queue status: {:?}", status.queue_type);
+
+    // 2. Publish two messages and recheck
+    queue.publish(topic, None, &Task { id: "1".into(), content: "first".into() }, None).await?;
+    queue.publish(topic, None, &Task { id: "2".into(), content: "second".into() }, None).await?;
+
+    let status = queue.queue_status(topic.to_string(), None).await?;
+    assert_eq!(status.queue_type, QueueType::Main);
+    assert_eq!(status.size, 2);
+    println!("After publishing: size={}", status.size);
+
+    // 3. Consume one message (moves it to processing) and check again
+    let consumed = queue.consume::<Task>(topic, None).await?;
+
+    let status = queue.queue_status(topic.to_string(), None).await?;
+    assert_eq!(status.size, 1);
+    assert_eq!(status.processing, 1);
+    println!("While processing: pending={}, in-flight={}", status.size, status.processing);
+
+    // 4. Acknowledge and confirm processing count drops
+    queue.acknowledge(topic, consumed).await?;
+
+    let status = queue.queue_status(topic.to_string(), None).await?;
+    assert_eq!(status.processing, 0);
+    println!("After ack: processing={}", status.processing);
+
+    // 5. Guard: empty queue name returns an error
+    let err = queue.queue_status("".to_string(), None).await;
+    assert!(err.is_err(), "Empty queue name must return an error");
+
+    Ok(())
+}
+```
+
+---
+
+## Fairness Queue Status
+
+When your topic uses disambiguators, `queue_status` can report on all sub-queues at once or on a specific one:
+
+```rust
+// All disambiguators combined
+let all_status = queue
+    .queue_status("render".to_string(), None)
+    .await?;
+
+println!(
+    "Total: size={}, disambiguators={}",
+    all_status.size,
+    all_status.disambiguator_count.unwrap_or(0)
+);
+
+// One specific tenant
+let tenant_status = queue
+    .queue_status("render".to_string(), Some("tenant-acme".to_string()))
+    .await?;
+
+println!(
+    "tenant-acme: size={}, processing={}, failed={}",
+    tenant_status.size, tenant_status.processing, tenant_status.failed
+);
+```
+
+---
+
+## Monitoring Pattern
+
+Use periodic polling to feed queue depth into your metrics system or trigger autoscaling. The example below uses a background `tokio::spawn` loop:
+
+```rust
+use std::time::Duration;
+
+let monitor_queue = queue.clone();
+tokio::spawn(async move {
+    loop {
+        match monitor_queue.queue_status("jobs".to_string(), None).await {
+            Ok(status) => {
+                // Emit to your metrics backend (e.g. Prometheus, Datadog)
+                metrics::gauge!("queue.size", status.size as f64, "queue" => "jobs");
+                metrics::gauge!("queue.processing", status.processing as f64, "queue" => "jobs");
+                metrics::gauge!("queue.failed", status.failed as f64, "queue" => "jobs");
+
+                // Alert if failed messages accumulate
+                if status.failed > 100 {
+                    eprintln!("WARNING: {} failed messages in 'jobs' queue", status.failed);
+                }
+            }
+            Err(e) => eprintln!("Failed to poll queue status: {e}"),
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+});
+```
+
+---
+
+## Management API Summary
+
+<CardGroup cols={2}>
+  <Card title="queue.size(name)" icon="chart-bar">
+    Always available — no feature flag needed. Returns `HashMap<String, u64>` with sub-queue counts. Empty name returns an error.
+  </Card>
+  <Card title="queue.queue_status(name, disambiguator)" icon="magnifying-glass-chart">
+    Requires `features = ["management"]`. Returns full `QueueStatus` with size, processing, failed, and disambiguator count.
+  </Card>
+  <Card title="QueueType enum" icon="tags">
+    Variants: `Main`, `Processing`, `Failed`, `Fairness`. Tells you which logical layer of the queue the status describes.
+  </Card>
+  <Card title="Broker support" icon="server">
+    `management` works with Redis and RabbitMQ. Incompatible with the `surrealdb` feature. Use `size()` for SurrealDB.
+  </Card>
+</CardGroup>

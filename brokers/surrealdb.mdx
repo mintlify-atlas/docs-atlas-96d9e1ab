@@ -1,0 +1,269 @@
+---
+title: "SurrealDB Broker Backend for Broccoli Queue"
+description: "Use SurrealDB as a Broccoli Queue backend for embedded or server-based deployments. Supports in-memory mode for testing and an existing connection with builder_with()."
+---
+
+The SurrealDB broker stores Broccoli Queue messages directly in SurrealDB tables, making it a natural fit for applications that already use SurrealDB as their primary database. It uses SurrealDB's live-query feature for efficient blocking consumption — when no messages are available, the broker subscribes to table changes rather than spinning in a polling loop. The broker supports both a standalone `ws://` server and an in-process `mem://` database, which makes it especially convenient for integration testing without any external infrastructure.
+
+## Enabling the SurrealDB Feature
+
+SurrealDB is not part of the default feature set. Add it to `Cargo.toml` and disable the default `redis` feature if you are using SurrealDB exclusively:
+
+<Tabs>
+  <Tab title="SurrealDB only">
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "0.4.6", default-features = false, features = ["surrealdb"] }
+    ```
+  </Tab>
+  <Tab title="SurrealDB + Redis">
+    ```toml
+    [dependencies]
+    broccoli_queue = { version = "0.4.6", features = ["surrealdb"] }
+    ```
+  </Tab>
+</Tabs>
+
+The `surrealdb` feature enables the `surrealdb` and `url` optional dependencies. The `kv-mem` SurrealDB feature is also activated, so `mem://` URLs work out of the box without any extra crate configuration.
+
+## Connecting to SurrealDB
+
+There are two ways to connect the broker to SurrealDB:
+
+### 1. URL-based connection
+
+Pass a URL to `BroccoliQueue::builder`. The broker parses the URL, signs in with the provided credentials, and selects the namespace and database:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder(
+        "ws://localhost:8000/?ns=myns&db=mydb&username=root&password=root",
+    )
+    .build()
+    .await?;
+
+    Ok(())
+}
+```
+
+### 2. Existing connection (`builder_with`)
+
+If your application already holds a `Surreal<Any>` connection, pass it directly to `BroccoliQueue::builder_with`. The broker will reuse that connection without opening a second one:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+use surrealdb::{engine::any::connect, opt::auth::Root};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Your existing SurrealDB connection
+    let db = connect("ws://localhost:8000").await?;
+    db.signin(Root { username: "root", password: "root" }).await?;
+    db.use_ns("myns").use_db("mydb").await?;
+
+    // Pass it to the builder — no second connection is opened
+    let queue = BroccoliQueue::builder_with(db)
+        .enable_scheduling(true)
+        .build()
+        .await?;
+
+    Ok(())
+}
+```
+
+<Note>
+The `surrealdb_connection` field on `BrokerConfig` (and the corresponding `BroccoliQueueBuilder::new_with_surrealdb` constructor, exposed as `BroccoliQueue::builder_with`) is only compiled when the `surrealdb` feature is active. When present, it takes priority over any URL-based connection: the broker uses the provided `Surreal<Any>` directly and skips the URL parsing and sign-in steps entirely.
+</Note>
+
+## URL Format
+
+```
+<protocol>://<host[:port]>/?ns=<namespace>&db=<database>[&username=<user>&password=<pass>]
+```
+
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `protocol` | ✅ | — | `ws` for server, `mem` for in-memory |
+| `host:port` | ✅ for `ws` | — | SurrealDB server address |
+| `ns` | ✅ | `test` | SurrealDB namespace |
+| `db` | ✅ | `test` | SurrealDB database |
+| `username` | ✅ for `ws` | `root` | Sign-in username |
+| `password` | ✅ for `ws` | `root` | Sign-in password |
+
+Only `ws://` and `mem://` schemes are supported. The `ws://` scheme requires a host, a port, and credentials. The `mem://` scheme requires none of those — SurrealDB runs embedded in the same process.
+
+## In-Memory Mode for Testing
+
+Use `mem://` to get a fully functional, zero-dependency queue in your test suite:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+#[tokio::test]
+async fn test_my_queue_handler() {
+    // No external server — SurrealDB runs embedded in this process
+    let queue = BroccoliQueue::builder("mem://")
+        .build()
+        .await
+        .expect("Failed to build queue");
+
+    queue.publish("test-topic", None, &"hello", None).await.unwrap();
+    // ... assert handler behaviour
+}
+```
+
+The `kv-mem` storage engine that backs `mem://` is included automatically by the `surrealdb` feature, so no additional Cargo flags are needed.
+
+## Feature Support
+
+| Feature | Supported | Notes |
+|---------|-----------|-------|
+| Priority (1–5) | ✅ | Stored as a field on the queue-entry record |
+| Scheduling / delays | ✅ | Requires `.enable_scheduling(true)` |
+| Fairness queues | ❌ | Not supported; `disambiguator` is ignored |
+| Management API | ❌ | Incompatible with SurrealDB; see warning below |
+| Batch publish | ✅ | `queue.publish_batch(...)` |
+| TTL | ❌ | Returns `BroccoliError::NotImplemented` |
+| Cancel | ✅ | Removes from the queue index and deletes the message record |
+| Blocking consume | ✅ | Uses SurrealDB live queries instead of polling |
+
+<Warning>
+The `management` Cargo feature is **not compatible** with the SurrealDB broker. The management API requires brokers to implement the `BrokerWithManagement` trait, which is only implemented for the Redis and RabbitMQ backends. Enabling `management` and `surrealdb` together will cause a compile-time error when Broccoli attempts to connect to a `ws://` or `mem://` URL.
+</Warning>
+
+## Concurrency and Non-Idempotent Operations
+
+<Warning>
+When multiple tasks consume from the **same topic** concurrently, the SurrealDB broker may return a `BroccoliError::BrokerNonIdempotentOp` error. This happens because SurrealDB's transactional semantics can detect conflicting reads between concurrent consumers and abort one of them rather than silently returning a duplicate message.
+
+You do not need to handle this error manually — `process_messages` catches `BrokerNonIdempotentOp` internally and retries the consume operation automatically. If you call `try_consume` or `consume` directly, match on this variant and retry:
+
+```rust
+use broccoli_queue::error::BroccoliError;
+
+loop {
+    match queue.try_consume::<MyPayload>("topic", None).await {
+        Ok(Some(msg)) => { /* handle */ break; }
+        Ok(None) => break, // queue empty
+        Err(BroccoliError::BrokerNonIdempotentOp(_)) => continue, // retry
+        Err(e) => return Err(e.into()),
+    }
+}
+```
+</Warning>
+
+## Internal Data Structures
+
+The SurrealDB broker represents queue state across three logical table groups per topic:
+
+| Table | Purpose |
+|-------|---------|
+| `{topic}` | Stores the actual message record: `task_id`, `payload`, `attempts` |
+| `{topic}_queue` | Queue-entry records: `[priority, timestamp, task_id]` composite key for ordered consumption |
+| `{topic}_processing` | In-flight message records; entries are removed on acknowledge or moved on reject |
+| `{topic}_failed` | Dead-letter records for messages that exhausted all retries |
+
+Consumption is O(N log N) where N is the number of pending entries, as the broker selects and removes the minimum-score entry from the queue table using SurrealDB's range-based query.
+
+## Full Example
+
+The example below shows a complete integration test using the in-memory SurrealDB backend — no Docker, no external processes:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+use broccoli_queue::brokers::broker::BrokerMessage;
+use broccoli_queue::error::BroccoliError;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ReportJob {
+    report_id: u64,
+    format: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // In-memory SurrealDB — perfect for tests or single-binary deployments
+    let queue = BroccoliQueue::builder("mem://")
+        .enable_scheduling(true)
+        .build()
+        .await?;
+
+    // Publish a handful of jobs
+    for i in 1..=5 {
+        queue
+            .publish(
+                "reports",
+                None,
+                &ReportJob {
+                    report_id: i,
+                    format: "pdf".to_string(),
+                },
+                Some(PublishOptions::builder().priority(3).build()),
+            )
+            .await?;
+    }
+
+    // Process up to 2 concurrent jobs
+    queue
+        .process_messages(
+            "reports",
+            Some(2),
+            None,
+            |message: BrokerMessage<ReportJob>| async move {
+                println!(
+                    "Generating {} report for ID {} (attempt {})",
+                    message.payload.format,
+                    message.payload.report_id,
+                    message.attempts,
+                );
+                Ok(())
+            },
+        )
+        .await?;
+
+    Ok(())
+}
+```
+
+### Using an Existing SurrealDB Connection
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+use broccoli_queue::brokers::broker::BrokerMessage;
+use surrealdb::{engine::any::connect, opt::auth::Root};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct MyJob { data: String }
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Application-level SurrealDB connection
+    let db = connect("ws://localhost:8000").await?;
+    db.signin(Root { username: "admin", password: "secret" }).await?;
+    db.use_ns("prod").use_db("app").await?;
+
+    // Broccoli reuses the same connection — no second handshake
+    let queue = BroccoliQueue::builder_with(db.clone())
+        .build()
+        .await?;
+
+    queue.publish("jobs", None, &MyJob { data: "work".to_string() }, None).await?;
+
+    queue
+        .process_messages(
+            "jobs",
+            Some(1),
+            None,
+            |message: BrokerMessage<MyJob>| async move {
+                println!("Processing: {}", message.payload.data);
+                Ok(())
+            },
+        )
+        .await?;
+
+    Ok(())
+}
+```

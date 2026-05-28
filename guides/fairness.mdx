@@ -1,0 +1,231 @@
+---
+title: "Fairness Queues with Disambiguators"
+description: "Use Broccoli Queue's disambiguator system to create per-tenant fairness queues that prevent any single producer from starving others. Redis-only feature."
+---
+
+In a multi-tenant or multi-user system it is common for one producer to overwhelm the queue with messages, starving every other producer until its backlog drains. Broccoli Queue's fairness system solves this problem by giving each producer its own sub-queue and rotating between them in round-robin order. A consumer that enables fairness mode will always pick from the least-recently-served sub-queue, regardless of how many messages are waiting in any individual lane.
+
+<Note>
+Fairness queues are a Redis-only feature. If you are using RabbitMQ or SurrealDB, the `disambiguator` parameter is accepted but fairness round-robin is not applied.
+</Note>
+
+---
+
+## The Disambiguator
+
+The disambiguator is a free-form string you pass as the second argument to `publish`. It identifies which lane the message belongs to. Typical values are:
+
+- Tenant IDs: `"tenant-acme"`, `"tenant-globex"`
+- User IDs: `"user-42"`, `"user-99"`
+- Job types: `"video-encoding"`, `"pdf-export"`
+
+Messages published with the same disambiguator go into the same sub-queue. Messages published with `None` go into the standard (non-fairness) main queue.
+
+<Tip>
+Use tenant IDs or authenticated user IDs as disambiguators when you want to prevent a single high-volume tenant from blocking all other tenants from being processed in a timely fashion.
+</Tip>
+
+---
+
+## How It Works Internally
+
+When you publish with a disambiguator, Redis stores the message in a sorted set named `{topic}_{disambiguator}_queue`. The broker also maintains a fairness set (`{topic}_fairness_set`) listing all active disambiguators and a round-robin list (`{topic}_fairness_round_robin`) that tracks which sub-queue was served last.
+
+When a consumer calls `consume` with `fairness: true`, the broker:
+
+1. Rotates to the next entry in the round-robin list.
+2. Pops the highest-priority (or earliest) message from that sub-queue.
+3. Places the message in `{topic}_{disambiguator}_processing` until acknowledged.
+
+This guarantees that no single producer lane is served twice in a row while another lane has waiting messages.
+
+---
+
+## Publishing with a Disambiguator
+
+Pass the disambiguator as the second argument to `publish` or `publish_batch`. Messages for the same topic but different disambiguators are completely independent:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RenderJob {
+    id: String,
+    asset: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .build()
+        .await?;
+
+    // Tenant ACME floods the queue with 100 jobs
+    for i in 0..100 {
+        let job = RenderJob {
+            id: format!("acme-{i}"),
+            asset: format!("asset-{i}.png"),
+        };
+        queue
+            .publish("render", Some("tenant-acme".to_string()), &job, None)
+            .await?;
+    }
+
+    // Tenant Globex submits just 2 jobs
+    for i in 0..2 {
+        let job = RenderJob {
+            id: format!("globex-{i}"),
+            asset: format!("report-{i}.pdf"),
+        };
+        queue
+            .publish("render", Some("tenant-globex".to_string()), &job, None)
+            .await?;
+    }
+
+    println!("Both tenants published. Fairness ensures Globex isn't starved.");
+    Ok(())
+}
+```
+
+---
+
+## Consuming with Fairness Enabled
+
+Set `fairness(true)` in your `ConsumeOptions`. Without this flag the consumer reads from the main queue (if you published without a disambiguator) or blocks waiting for it.
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, ConsumeOptions};
+use broccoli_queue::brokers::broker::BrokerMessage;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .build()
+        .await?;
+
+    let consume_opts = ConsumeOptions::builder()
+        .fairness(true)
+        .build();
+
+    // process_messages honours ConsumeOptions, including fairness
+    queue
+        .process_messages(
+            "render",
+            Some(4),
+            Some(consume_opts),
+            |msg: BrokerMessage<RenderJob>| async move {
+                println!(
+                    "Processing {} (tenant: {:?})",
+                    msg.payload.id, msg.disambiguator
+                );
+                Ok(())
+            },
+        )
+        .await?;
+
+    Ok(())
+}
+```
+
+---
+
+## Full Multi-Tenant Example
+
+The example below mirrors the pattern verified in `tests/fairness.rs`. Three tenants each publish two messages. The consumer, with fairness enabled, consumes them in round-robin order — one from each tenant before cycling back.
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, ConsumeOptions};
+use broccoli_queue::brokers::broker::BrokerMessage;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkItem {
+    tenant: String,
+    payload: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .build()
+        .await?;
+
+    // Three tenants publish messages
+    let producers = [
+        ("tenant-a", vec!["a-msg-1", "a-msg-2"]),
+        ("tenant-b", vec!["b-msg-1", "b-msg-2"]),
+        ("tenant-c", vec!["c-msg-1", "c-msg-2"]),
+    ];
+
+    for (tenant, messages) in &producers {
+        for content in messages {
+            let item = WorkItem {
+                tenant: tenant.to_string(),
+                payload: content.to_string(),
+            };
+            queue
+                .publish("work", Some(tenant.to_string()), &item, None)
+                .await?;
+        }
+    }
+
+    // Consumer uses fairness round-robin
+    let consume_opts = ConsumeOptions::builder()
+        .fairness(true)
+        .build();
+
+    let mut order = Vec::new();
+    for _ in 0..6 {
+        let msg = queue
+            .consume::<WorkItem>("work", Some(consume_opts.clone()))
+            .await?;
+        order.push(msg.payload.tenant.clone());
+        queue.acknowledge("work", msg).await?;
+    }
+
+    // Round-robin: a, b, c, a, b, c
+    println!("Consumption order: {:?}", order);
+    assert_eq!(order[0], "tenant-a");
+    assert_eq!(order[1], "tenant-b");
+    assert_eq!(order[2], "tenant-c");
+    assert_eq!(order[3], "tenant-a");
+
+    Ok(())
+}
+```
+
+---
+
+## Inspecting Sub-Queue Sizes
+
+`queue.size(topic)` returns a `HashMap<String, u64>` mapping each sub-queue's full name to the number of messages waiting. For a fairness topic with two active tenants you get two entries:
+
+```rust
+let sizes = queue.size("render").await?;
+
+// Example output:
+// {
+//   "render_tenant-acme_queue": 98,
+//   "render_tenant-globex_queue": 0,
+// }
+for (sub_queue, count) in &sizes {
+    println!("{sub_queue}: {count} messages");
+}
+```
+
+---
+
+## Queue Naming Convention
+
+Understanding the naming scheme helps when you inspect Redis directly or use the management API.
+
+| Queue role | Key pattern |
+|---|---|
+| Per-disambiguator messages | `{topic}_{disambiguator}_queue` |
+| In-flight processing | `{topic}_{disambiguator}_processing` |
+| Failed messages | `{topic}_{disambiguator}_failed` |
+| Fairness membership set | `{topic}_fairness_set` |
+| Round-robin cursor list | `{topic}_fairness_round_robin` |
+
+For example, publishing to topic `"render"` with disambiguator `"tenant-acme"` creates the key `render_tenant-acme_queue`. When the consumer picks up a message it moves it to `render_tenant-acme_processing`, then removes it on acknowledgment.

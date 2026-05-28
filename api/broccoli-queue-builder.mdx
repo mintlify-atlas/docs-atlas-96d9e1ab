@@ -1,0 +1,253 @@
+---
+title: "BroccoliQueueBuilder — Queue Configuration"
+description: "BroccoliQueueBuilder configures retry strategy, connection pool size, and message scheduling before creating a BroccoliQueue with the async build() method."
+---
+
+`BroccoliQueueBuilder` provides a fluent interface for configuring a [`BroccoliQueue`](/api/broccoli-queue) before connecting to a broker. You obtain a builder by calling `BroccoliQueue::builder(url)` (or `BroccoliQueue::builder_with(db)` for an existing SurrealDB connection), chain any configuration methods you need, then call the async `build()` method which establishes the broker connection and returns a ready-to-use `BroccoliQueue`.
+
+---
+
+## Creating a Builder
+
+```rust
+// Standard URL-based construction
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .failed_message_retry_strategy(RetryStrategy::new().with_attempts(5))
+    .pool_connections(10)
+    .enable_scheduling(false)
+    .build()
+    .await?;
+```
+
+```rust
+// SurrealDB — reuse an existing connection (requires `surrealdb` feature)
+let queue = BroccoliQueue::builder_with(db)
+    .pool_connections(5)
+    .build()
+    .await?;
+```
+
+---
+
+## Builder Methods
+
+### `new`
+
+Creates a `BroccoliQueueBuilder` from a broker URL string. This is called implicitly when you use `BroccoliQueue::builder(url)`.
+
+```rust
+pub fn new(broker_url: impl Into<String>) -> Self
+```
+
+<ParamField path="broker_url" type="impl Into<String>" required>
+  The connection URL for the message broker. The URL scheme determines which broker implementation is selected at runtime (`redis://`, `amqp://`, or a SurrealDB WebSocket URL).
+</ParamField>
+
+**Returns** — A new `BroccoliQueueBuilder` with all options set to their defaults.
+
+---
+
+### `new_with_surrealdb` <span style={{fontSize: "0.8em", color: "#888"}}>[`surrealdb` feature]</span>
+
+Creates a `BroccoliQueueBuilder` that reuses an existing `Surreal<Any>` database connection instead of opening a new one from a URL. Called implicitly by `BroccoliQueue::builder_with(db)`.
+
+```rust
+#[cfg(feature = "surrealdb")]
+pub fn new_with_surrealdb(db: surrealdb::Surreal<surrealdb::engine::any::Any>) -> Self
+```
+
+<ParamField path="db" type="surrealdb::Surreal<surrealdb::engine::any::Any>" required>
+  An already-connected SurrealDB client. The broker URL is set to the placeholder `ws://unused` internally and is not used for dialing.
+</ParamField>
+
+**Returns** — A new `BroccoliQueueBuilder` with the provided database connection stored.
+
+---
+
+### `failed_message_retry_strategy`
+
+Sets the retry behaviour for messages that are rejected. Applies the configuration from a [`RetryStrategy`](#retrystrategy) value.
+
+```rust
+pub const fn failed_message_retry_strategy(mut self, strategy: RetryStrategy) -> Self
+```
+
+<ParamField path="strategy" type="RetryStrategy" required>
+  A `RetryStrategy` describing whether to retry failed messages and how many times. The default strategy retries up to **3** times.
+</ParamField>
+
+**Returns** — `Self` for method chaining.
+
+```rust
+use broccoli_queue::queue::RetryStrategy;
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .failed_message_retry_strategy(
+        RetryStrategy::new()
+            .retry_failed(true)
+            .with_attempts(10),
+    )
+    .build()
+    .await?;
+```
+
+---
+
+### `pool_connections`
+
+Sets how many broker connections the internal connection pool maintains. A larger pool reduces contention under high publish or consume throughput.
+
+```rust
+pub const fn pool_connections(mut self, connections: u8) -> Self
+```
+
+<ParamField path="connections" type="u8" required>
+  Number of pooled connections to open when `build()` is called. Defaults to **10** if not set.
+</ParamField>
+
+**Returns** — `Self` for method chaining.
+
+```rust
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .pool_connections(20)
+    .build()
+    .await?;
+```
+
+---
+
+### `enable_scheduling`
+
+Enables or disables support for delayed and scheduled message delivery (used by `PublishOptions::delay` and `PublishOptions::schedule_at`).
+
+```rust
+pub const fn enable_scheduling(mut self, enable_scheduling: bool) -> Self
+```
+
+<ParamField path="enable_scheduling" type="bool" required>
+  Pass `true` to enable scheduling. Defaults to `false`.
+</ParamField>
+
+**Returns** — `Self` for method chaining.
+
+<Warning>
+  When using RabbitMQ with `enable_scheduling(true)`, you must install the **delayed-exchange plugin** on your broker node. Without it, scheduled messages will not be delivered. See the [RabbitMQ scheduling blog post](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq) for setup instructions.
+</Warning>
+
+```rust
+let queue = BroccoliQueue::builder("amqp://guest:guest@localhost:5672")
+    .enable_scheduling(true) // requires rabbitmq_delayed_message_exchange plugin
+    .build()
+    .await?;
+```
+
+---
+
+### `build`
+
+Consumes the builder, connects to the broker using the configured URL (or existing SurrealDB connection), initialises the connection pool, and returns a `BroccoliQueue`.
+
+```rust
+pub async fn build(self) -> Result<BroccoliQueue, BroccoliError>
+```
+
+**Returns** — `Ok(BroccoliQueue)` ready for use. Returns `Err(BroccoliError::Broker(_))` if the broker connection cannot be established.
+
+```rust
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .pool_connections(5)
+    .build()
+    .await
+    .expect("Failed to connect to Redis");
+```
+
+---
+
+## `RetryStrategy`
+
+`RetryStrategy` is a small configuration struct that controls what happens when a message is rejected. It is passed to `failed_message_retry_strategy()` on the builder.
+
+```rust
+pub struct RetryStrategy {
+    pub retry_failed: bool,
+    pub attempts: Option<u8>,
+}
+```
+
+### Fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `retry_failed` | `bool` | `true` | If `true`, rejected messages are re-queued. If `false`, they are immediately moved to the failed queue. |
+| `attempts` | `Option<u8>` | `Some(3)` | Maximum number of delivery attempts. `None` falls back to 3. |
+
+### `RetryStrategy` Methods
+
+```rust
+pub const fn new() -> Self
+```
+Creates a `RetryStrategy` with `retry_failed: true` and `attempts: Some(3)`.
+
+```rust
+pub const fn with_attempts(mut self, attempts: u8) -> Self
+```
+<ParamField path="attempts" type="u8" required>
+  The maximum number of retry attempts before a message is considered permanently failed.
+</ParamField>
+
+```rust
+pub const fn retry_failed(mut self, retry_failed: bool) -> Self
+```
+<ParamField path="retry_failed" type="bool" required>
+  Set to `false` to disable retries entirely. Failed messages are moved directly to the failed queue on first rejection.
+</ParamField>
+
+```rust
+// Retry up to 5 times
+let strategy = RetryStrategy::new().with_attempts(5);
+
+// Never retry — move directly to the failed queue
+let strategy = RetryStrategy::new().retry_failed(false);
+
+// Default: retry 3 times
+let strategy = RetryStrategy::default();
+```
+
+---
+
+## `BrokerConfig` Reference
+
+`BrokerConfig` is the internal struct constructed by `build()` from your builder settings and passed to the underlying broker. You do not construct it directly, but its fields mirror the builder API:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `retry_attempts` | `Option<u8>` | `Some(3)` | Max retry attempts for failed messages |
+| `retry_failed` | `Option<bool>` | `Some(true)` | Whether to retry failed messages |
+| `pool_connections` | `Option<u8>` | `Some(10)` | Connection pool size |
+| `enable_scheduling` | `Option<bool>` | `Some(false)` | Enable delayed/scheduled delivery |
+| `surrealdb_connection` | `Option<Surreal<Any>>` | `None` | Reused SurrealDB connection (`surrealdb` feature only) |
+
+---
+
+## Full Example
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, RetryStrategy};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .failed_message_retry_strategy(
+            RetryStrategy::new()
+                .retry_failed(true)
+                .with_attempts(5),
+        )
+        .pool_connections(10)
+        .enable_scheduling(false)
+        .build()
+        .await?;
+
+    println!("Connected and ready!");
+    Ok(())
+}
+```

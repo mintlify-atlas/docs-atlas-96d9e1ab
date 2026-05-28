@@ -1,0 +1,196 @@
+---
+title: "Messages: BrokerMessage and Type Safety"
+description: "Broccoli Queue wraps every payload in BrokerMessage<T>, adding task_id, attempt count, and disambiguator. Learn the message lifecycle from publish to ack."
+---
+
+Every value you send through Broccoli Queue travels inside a `BrokerMessage<T>` envelope. This wrapper attaches a unique identifier, a retry counter, and an optional routing hint to your payload without touching the payload type itself. Because the envelope is generic over `T`, the compiler guarantees that the type you publish is exactly the type you receive in your handler — no stringly-typed parsing, no runtime type mismatches.
+
+## The `BrokerMessage<T>` struct
+
+```rust
+use broccoli_queue::brokers::broker::BrokerMessage;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BrokerMessage<T: Clone> {
+    /// Unique identifier assigned at publish time.
+    pub task_id: uuid::Uuid,
+    /// Your message payload.
+    pub payload: T,
+    /// How many processing attempts have been made (starts at 0).
+    pub attempts: u8,
+    /// Optional routing hint used for fairness queues.
+    pub disambiguator: Option<String>,
+    // metadata is pub(crate) and not part of the public API.
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `task_id` | `uuid::Uuid` | Auto-generated v4 UUID. Use this to correlate logs across services or to cancel a specific message with `queue.cancel(topic, task_id.to_string())`. |
+| `payload` | `T` | Your application data. Deserialized from JSON by the broker layer before your handler is called. |
+| `attempts` | `u8` | Zero-indexed counter incremented each time the message is re-queued after a rejection. Inspect this in your handler to apply back-off logic. |
+| `disambiguator` | `Option<String>` | An arbitrary string (e.g., a tenant ID or user ID) used to partition messages into per-key fairness sub-queues. `None` uses the default queue. |
+
+## Type requirements for `T`
+
+Your payload type must satisfy:
+
+```rust
+T: Clone + serde::Serialize + serde::de::DeserializeOwned
+```
+
+`Clone` is needed because `process_messages` may hand the same message to success and error callbacks. `Serialize` + `DeserializeOwned` are needed for JSON round-tripping through the broker. A typical payload type looks like this:
+
+```rust
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ResizeImageJob {
+    image_id: uuid::Uuid,
+    target_width: u32,
+    target_height: u32,
+}
+```
+
+## Creating a message
+
+You rarely construct a `BrokerMessage` directly — `queue.publish()` creates one internally and returns it so you can inspect the assigned `task_id`:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .build()
+    .await?;
+
+let job = ResizeImageJob {
+    image_id: uuid::Uuid::new_v4(),
+    target_width: 800,
+    target_height: 600,
+};
+
+// publish() wraps `job` in a BrokerMessage and returns it.
+let message = queue.publish("image-jobs", None, &job, None).await?;
+println!("Queued task {}", message.task_id);
+```
+
+If you need to route the message to a fairness sub-queue (so that one busy tenant cannot starve others), pass a disambiguator:
+
+```rust
+let message = queue
+    .publish("image-jobs", Some("tenant-42".to_string()), &job, None)
+    .await?;
+```
+
+## Message lifecycle
+
+```
+publish()
+    │
+    ▼
+[main queue]  ──────── consume() / process_messages() ──────► [processing queue]
+                                                                      │
+                                        ┌─────────────────────────────┤
+                                        │                             │
+                                    handler Ok                   handler Err
+                                        │                             │
+                                   acknowledge()                  reject()
+                                        │                             │
+                                   [removed]            attempts < max? ──yes──► [main queue] (attempts++)
+                                                              │
+                                                             no
+                                                              │
+                                                    [{topic}_failed queue]
+```
+
+<Steps>
+  <Step title="Publish">
+    `queue.publish()` serializes your payload to JSON, wraps it with a new `task_id` and `attempts = 0`, and pushes it to the named topic queue.
+  </Step>
+
+  <Step title="Consume">
+    `queue.consume()` (or the loop inside `process_messages`) atomically moves the message from the main queue to an in-flight processing queue. The message is not lost if your process crashes before acknowledging.
+  </Step>
+
+  <Step title="Acknowledge or reject">
+    After processing, you signal the outcome:
+
+    - **`queue.acknowledge(topic, message)`** — the message is permanently removed from the processing queue. Use this on success.
+    - **`queue.reject(topic, message)`** — the broker applies the retry strategy. If attempts remain, the message re-enters the main queue with `attempts` incremented. Once the limit is reached it moves to `{topic}_failed`.
+
+    `process_messages` calls these automatically based on whether your handler returns `Ok` or `Err`.
+  </Step>
+</Steps>
+
+## Acknowledgment vs rejection
+
+<Tabs>
+  <Tab title="Acknowledge">
+    Call `acknowledge` when your handler has fully and successfully processed the message. The message is deleted from the broker and will never be delivered again.
+
+    ```rust
+    let message = queue.consume::<ResizeImageJob>("image-jobs", None).await?;
+
+    match resize_image(&message.payload).await {
+        Ok(_) => {
+            queue.acknowledge("image-jobs", message).await?;
+        }
+        Err(e) => {
+            // handle below
+        }
+    }
+    ```
+  </Tab>
+
+  <Tab title="Reject">
+    Call `reject` when processing failed and you want Broccoli to apply the retry strategy. If you have configured `retry_failed(true)` (the default) and attempts remain, the message will be re-queued.
+
+    ```rust
+    // Manually reject — e.g., after a partial failure in a custom workflow.
+    queue.reject("image-jobs", message).await?;
+    ```
+
+    You can also call `reject` proactively to immediately dead-letter a message without waiting for retries to exhaust:
+
+    ```rust
+    if message.attempts >= 2 {
+        // Skip retries and send directly to the failed queue.
+        queue.reject("image-jobs", message).await?;
+    }
+    ```
+  </Tab>
+
+  <Tab title="Cancel">
+    Call `cancel` to remove a specific message from the queue by its `task_id` before it has been consumed. Useful for job revocation.
+
+    ```rust
+    queue.cancel("image-jobs", task_id.to_string()).await?;
+    ```
+  </Tab>
+</Tabs>
+
+## `InternalBrokerMessage` (internal representation)
+
+`BrokerMessage<T>` is the public-facing type. Internally, Broccoli converts it to `InternalBrokerMessage` before writing to the broker:
+
+```rust
+pub struct InternalBrokerMessage {
+    pub task_id: String,    // UUID as a string
+    pub payload: String,    // JSON-serialized payload
+    pub attempts: u8,
+    pub disambiguator: Option<String>,
+}
+```
+
+The conversion is automatic via `From<BrokerMessage<T>> for InternalBrokerMessage` and the reverse `into_message::<T>()` call. You will not normally interact with this type unless you are implementing a custom broker.
+
+<Note>
+  Failed messages — those that have exhausted all retry attempts — accumulate in a dedicated `{topic}_failed` queue. For example, messages on the `image-jobs` topic will land in `image-jobs_failed`. You can re-process or inspect these messages independently, which makes them useful as a dead-letter queue for debugging and recovery workflows.
+</Note>
+
+<CardGroup cols={2}>
+  <Card title="Retry Strategies" icon="arrows-rotate" href="/concepts/retry-strategy">
+    Control how many times a rejected message is retried before it is dead-lettered.
+  </Card>
+  <Card title="Broker Backends" icon="server" href="/concepts/brokers">
+    Understand how each broker stores messages in-flight and in the failed queue.
+  </Card>
+</CardGroup>
