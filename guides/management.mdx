@@ -1,5 +1,5 @@
 ---
-title: "Queue Management and Status Monitoring"
+title: "Broccoli Queue: Management API and Status Monitoring"
 description: "Enable the management feature flag to inspect queue status, size, processing count, and failed message count. Use queue_status and size for observability."
 ---
 
@@ -17,7 +17,7 @@ broccoli_queue = { version = "*", features = ["redis", "management"] }
 ```
 
 <Note>
-The `management` feature is compatible with Redis and RabbitMQ brokers. It is **not** compatible with the `surrealdb` feature — if you enable both, the build will fail. Use `queue.size()` (always available, no feature required) as a lighter alternative when working with SurrealDB.
+The `management` feature is implemented for Redis and RabbitMQ brokers only — `queue_status` is not available for SurrealDB. If SurrealDB is your only enabled broker feature, adding `management` will produce a compile error. Use `queue.size()` (always available, no feature required) as a lighter alternative when working with SurrealDB.
 </Note>
 
 ---

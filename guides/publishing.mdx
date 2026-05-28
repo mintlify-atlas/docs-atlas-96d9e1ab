@@ -1,5 +1,5 @@
 ---
-title: "Publishing Messages to a Queue"
+title: "Broccoli Queue: Publishing Single and Batch Messages"
 description: "Use BroccoliQueue to publish single messages, batch messages, and configure TTL, priority, delay, and scheduled delivery with PublishOptions."
 ---
 
@@ -115,7 +115,7 @@ pub struct PublishOptions {
     Time-to-live for the message. After this duration elapses the broker may discard the message before it is consumed. Uses `time::Duration`.
   </Card>
   <Card title="priority: Option<u8>" icon="arrow-up-9-1">
-    Message priority from **1 (highest)** to **5 (lowest)**. Higher-priority messages are consumed first within the same queue. Panics at build time if outside 1–5.
+    Message priority from **1 (highest)** to **5 (lowest)**. Higher-priority messages are consumed first within the same queue. Panics at runtime if outside 1–5.
   </Card>
   <Card title="delay: Option<Duration>" icon="hourglass-half">
     Holds the message for the specified duration before making it available for consumption. Relative to the time of publishing.

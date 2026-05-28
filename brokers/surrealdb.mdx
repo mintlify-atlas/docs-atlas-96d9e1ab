@@ -40,7 +40,7 @@ use broccoli_queue::queue::BroccoliQueue;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queue = BroccoliQueue::builder(
-        "ws://localhost:8000/?ns=myns&db=mydb&username=root&password=root",
+        "ws://localhost:8000/?ns=myns&database=mydb&username=root&password=root",
     )
     .build()
     .await?;
@@ -81,7 +81,7 @@ The `surrealdb_connection` field on `BrokerConfig` (and the corresponding `Brocc
 ## URL Format
 
 ```
-<protocol>://<host[:port]>/?ns=<namespace>&db=<database>[&username=<user>&password=<pass>]
+<protocol>://<host[:port]>/?ns=<namespace>&database=<database>[&username=<user>&password=<pass>]
 ```
 
 | Parameter | Required | Default | Description |
@@ -89,7 +89,7 @@ The `surrealdb_connection` field on `BrokerConfig` (and the corresponding `Brocc
 | `protocol` | ✅ | — | `ws` for server, `mem` for in-memory |
 | `host:port` | ✅ for `ws` | — | SurrealDB server address |
 | `ns` | ✅ | `test` | SurrealDB namespace |
-| `db` | ✅ | `test` | SurrealDB database |
+| `database` | ✅ | `test` | SurrealDB database |
 | `username` | ✅ for `ws` | `root` | Sign-in username |
 | `password` | ✅ for `ws` | `root` | Sign-in password |
 
@@ -157,14 +157,15 @@ loop {
 
 ## Internal Data Structures
 
-The SurrealDB broker represents queue state across three logical table groups per topic:
+The SurrealDB broker represents queue state across four logical table groups per topic:
 
 | Table | Purpose |
 |-------|---------|
 | `{topic}` | Stores the actual message record: `task_id`, `payload`, `attempts` |
-| `{topic}_queue` | Queue-entry records: `[priority, timestamp, task_id]` composite key for ordered consumption |
-| `{topic}_processing` | In-flight message records; entries are removed on acknowledge or moved on reject |
-| `{topic}_failed` | Dead-letter records for messages that exhausted all retries |
+| `{topic}___queue` | Queue-entry records: `[priority, timestamp, task_id]` composite key for ordered consumption |
+| `{topic}___processing` | In-flight message records; entries are removed on acknowledge or moved on reject |
+| `{topic}___index` | Index mapping `task_id` → queue-entry record ID, enabling O(k) cancellation |
+| `{topic}___failed` | Dead-letter records for messages that exhausted all retries |
 
 Consumption is O(N log N) where N is the number of pending entries, as the broker selects and removes the minimum-score entry from the queue table using SurrealDB's range-based query.
 

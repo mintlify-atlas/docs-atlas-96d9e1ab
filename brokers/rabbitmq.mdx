@@ -46,7 +46,7 @@ amqp://[user:password@]host[:port][/vhost]
     docker run -d \
       -p 5672:5672 \
       -p 15672:15672 \
-      rabbitmq:3-management
+      rabbitmq:4-management
     ```
   </Tab>
   <Tab title="With delayed-message plugin (scheduling)">
@@ -168,7 +168,7 @@ Each queue is declared with:
 Messages are published as persistent deliveries (`delivery_mode: 2`) with a unique `message_id` property set to the Broccoli `task_id`.
 
 <Tip>
-The RabbitMQ management UI is available at [http://localhost:15672](http://localhost:15672) when using the `rabbitmq:3-management` Docker image or the custom `Dockerfile.rabbitmq`. Log in with `guest`/`guest` to inspect queue depths, message rates, consumer counts, and dead-letter contents in real time — without writing any code.
+The RabbitMQ management UI is available at [http://localhost:15672](http://localhost:15672) when using the `rabbitmq:4-management` Docker image or the custom `Dockerfile.rabbitmq`. Log in with `guest`/`guest` to inspect queue depths, message rates, consumer counts, and dead-letter contents in real time — without writing any code.
 </Tip>
 
 ## Full Example

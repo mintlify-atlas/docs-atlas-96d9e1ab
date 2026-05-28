@@ -1,6 +1,6 @@
 ---
-title: "Scheduling and Delaying Messages"
-description: "Schedule messages for future delivery using PublishOptions delay and scheduled_at. Enable scheduling in BroccoliQueue builder and configure RabbitMQ if needed."
+title: "Scheduling and Delaying Messages in Broccoli Queue"
+description: "Schedule messages for future delivery using delay and scheduled_at in PublishOptions. Enable scheduling on the builder; RabbitMQ requires a plugin."
 ---
 
 Broccoli Queue can hold a message until a future moment before making it visible to consumers. You can express delivery timing in two ways: a relative delay from the time of publishing, or an absolute timestamp. Both are configured through `PublishOptions` and require scheduling to be explicitly enabled on the queue instance.

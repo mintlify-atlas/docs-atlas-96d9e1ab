@@ -30,7 +30,7 @@ Broccoli Queue is published on [crates.io](https://crates.io/crates/broccoli_que
 
     The Redis feature pulls in `bb8-redis` (an async connection pool built on `bb8`) and the `redis` crate compiled with TLS support via `tokio-rustls`. Point the builder at any Redis-compatible URL:
 
-    ```toml
+    ```text
     # Standard local Redis
     redis://localhost:6379
 
@@ -60,7 +60,7 @@ Broccoli Queue is published on [crates.io](https://crates.io/crates/broccoli_que
 
     The `rabbitmq` feature brings in `lapin` (the AMQP client), `deadpool`, and `deadpool-lapin` for connection pooling. Use a standard AMQP URL:
 
-    ```toml
+    ```text
     amqp://guest:guest@localhost:5672/%2f
     ```
 
@@ -81,7 +81,7 @@ Broccoli Queue is published on [crates.io](https://crates.io/crates/broccoli_que
 
     You can connect via a WebSocket URL to a running SurrealDB server:
 
-    ```toml
+    ```text
     ws://localhost:8000
     ```
 
@@ -122,7 +122,7 @@ Broccoli Queue is published on [crates.io](https://crates.io/crates/broccoli_que
 
 ## Management API
 
-The optional `management` feature unlocks the `BroccoliQueue::queue_status` method, which returns a `QueueStatus` value containing the number of pending, in-flight, and failed messages for a given topic and disambiguator. Pair it with any broker feature:
+The optional `management` feature unlocks the `BroccoliQueue::queue_status` method, which returns a `QueueStatus` value containing the total queue size, in-flight processing count, and failed message count for a given topic and disambiguator. Pair it with any broker feature:
 
 ```toml
 [dependencies]
@@ -141,7 +141,7 @@ let status = queue
     .queue_status("jobs".to_string(), None)
     .await?;
 
-println!("Pending: {}", status.pending);
+println!("Queue size: {}", status.size);
 println!("Processing: {}", status.processing);
 println!("Failed: {}", status.failed);
 ```

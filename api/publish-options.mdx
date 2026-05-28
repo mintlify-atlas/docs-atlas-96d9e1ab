@@ -26,7 +26,7 @@ pub struct PublishOptions {
 </ParamField>
 
 <ParamField path="priority" type="Option<u8>">
-  Priority level for the message. Must be between **1** (highest priority) and **5** (lowest priority). Messages with a lower numeric priority value are delivered before messages with a higher value. Defaults to `None`, which the broker treats as priority 5 (lowest). Setting a value outside 1–5 via the builder panics at runtime.
+  Priority level for the message. Must be between **1** (highest priority) and **5** (lowest priority). Messages with a lower numeric priority value are delivered before messages with a higher value. Defaults to `None` (no priority set; the broker applies its own default behaviour). Setting a value outside 1–5 via the builder panics at runtime.
 </ParamField>
 
 <ParamField path="delay" type="Option<time::Duration>">
@@ -189,7 +189,7 @@ When `None` is passed as the `options` argument to `publish` or `publish_batch`,
 | Field | Default |
 |---|---|
 | `ttl` | `None` — no expiry |
-| `priority` | `None` — treated as priority 5 (lowest) |
+| `priority` | `None` — no priority assigned (broker default applies) |
 | `delay` | `None` — immediate delivery |
 | `scheduled_at` | `None` — immediate delivery |
 

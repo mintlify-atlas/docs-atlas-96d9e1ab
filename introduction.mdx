@@ -30,7 +30,7 @@ Broccoli Queue (`broccoli_queue`) is an async Rust library for building reliable
     Delay delivery with `PublishOptions::delay` or set an exact `scheduled_at` timestamp. RabbitMQ scheduling requires the [delayed-exchange plugin](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq).
   </Card>
   <Card title="Management API" icon="chart-bar">
-    Opt in to the `management` feature to unlock `BroccoliQueue::queue_status`, which surfaces pending, processing, and failed message counts for any named queue.
+    Opt in to the `management` feature to unlock `BroccoliQueue::queue_status`, which surfaces total queue size, in-flight processing count, and failed message count for any named queue.
   </Card>
 </CardGroup>
 
